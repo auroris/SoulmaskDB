@@ -115,7 +115,7 @@ window.SMDB_LOCALES.zh = {
   'gloss.DaoJu':         '道具',
   'gloss.RongQi':        '容器',
   'gloss.GuanLiQi':      '管理器',
-  'gloss.WenMingGuanLiQi': '文明管理器',
+  'gloss.WenMing':       '文明',
   'gloss.CaiLiao':       '材料',
   'gloss.WuQi':          '武器',
   'gloss.Wuqi':          '武器',

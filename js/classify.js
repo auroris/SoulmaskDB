@@ -100,14 +100,46 @@ SMDB.classify = (() => {
   }
 
   // Romanized-Mandarin blueprint identifier → friendly per-locale words.
-  // The gloss table lives in js/locale/{en,zh}.js under 'gloss.*'; missing
+  // Gloss table lives in js/locale/{en,zh}.js under 'gloss.*'; missing
   // tokens fall back to the raw token (right default for new
   // game-introduced names we haven't yet mapped).
+  //
+  // Strips Unreal's conventional prefixes (BP_ blueprint, H WS-class
+  // marker) and the _C class suffix, then decomposes each
+  // underscore-separated part token-by-token. A "token" may itself be a
+  // PascalCase compound like "ZhiBeiGuanLiQi"; decomposeIdent walks the
+  // longest gloss-prefix and recurses so 'ZhiBei' + 'GuanLiQi' both
+  // translate without needing a one-shot compound entry.
   function translateIdent(ident) {
     if (!ident) return '';
-    const cleaned = ident.replace(/^BP_/, '').replace(/_C$/, '');
-    const parts = cleaned.split(/[_.]/).filter(Boolean);
-    return parts.map(p => SMDB.i18n.t('gloss.' + p, { default: p })).join(' ');
+    const cleaned = ident
+      .replace(/^BP_/, '')
+      .replace(/^H(?=[A-Z][a-z])/, '')
+      .replace(/_C$/, '');
+    return cleaned.split(/[_.]/).filter(Boolean).map(decomposeIdent).join(' ');
+  }
+
+  function decomposeIdent(token) {
+    if (!token) return '';
+    const tr = SMDB.i18n.t;
+    let v = tr('gloss.' + token, { default: null });
+    if (v != null) return v;
+    // Whole-token miss: look for the longest PascalCase prefix that has
+    // a gloss entry, then recurse on what's left. Iterating from the
+    // end yields the longest match first.
+    for (let i = token.length - 1; i > 0; i--) {
+      if (!isPascalBoundary(token, i)) continue;
+      v = tr('gloss.' + token.slice(0, i), { default: null });
+      if (v != null) {
+        const rest = decomposeIdent(token.slice(i));
+        return rest ? v + ' ' + rest : v;
+      }
+    }
+    return token;
+  }
+
+  function isPascalBoundary(s, i) {
+    return /[a-z]/.test(s[i - 1]) && /[A-Z]/.test(s[i]);
   }
 
   // Predicates — callers can ask "is this a player row?" without restating

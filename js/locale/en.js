@@ -265,7 +265,7 @@ window.SMDB_LOCALES.en = {
   'gloss.DaoJu':         'item',
   'gloss.RongQi':        'container',
   'gloss.GuanLiQi':      'manager',
-  'gloss.WenMingGuanLiQi': 'civilization manager',
+  'gloss.WenMing':       'civilization',
   'gloss.CaiLiao':       'material',
   'gloss.WuQi':          'weapon',
   'gloss.Wuqi':          'weapon',
