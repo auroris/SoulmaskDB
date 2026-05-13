@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Soulmask world.db browser</title>
+<style>
+  :root {
+    --bg: #1e1e1e;
+    --panel: #252526;
+    --panel2: #2d2d30;
+    --border: #3e3e42;
+    --text: #d4d4d4;
+    --muted: #858585;
+    --accent: #569cd6;
+    --warn: #ce9178;
+    --danger: #f48771;
+    --ok: #6a9955;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace; height: 100%; overflow: hidden; }
+  body { display: flex; flex-direction: column; }
+  header { padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--border);
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 13px; margin: 0; font-weight: normal; color: var(--accent); letter-spacing: 0.5px; }
+  .spacer { flex: 1; }
+  button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    padding: 4px 10px; cursor: pointer; font: inherit; border-radius: 2px;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { border-color: var(--accent); color: var(--accent); }
+  button.danger  { color: var(--danger); border-color: var(--border); }
+  button.danger:hover:not(:disabled) { border-color: var(--danger); }
+  input[type="text"], input[type="search"], select, input[type="file"], textarea {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    padding: 4px 8px; font: inherit; border-radius: 2px; min-width: 0;
+  }
+  textarea { font-family: inherit; resize: vertical; }
+  input[type="file"]::file-selector-button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    padding: 2px 8px; margin-right: 8px; font: inherit; border-radius: 2px; cursor: pointer;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  #summary { padding: 6px 12px; background: var(--panel); border-bottom: 1px solid var(--border);
+    display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px; }
+  .stat { display: flex; gap: 6px; align-items: center; }
+  .stat b { color: var(--accent); font-weight: normal; }
+  #controls { padding: 6px 12px; display: flex; gap: 8px; align-items: center;
+    border-bottom: 1px solid var(--border); background: var(--panel); }
+  #controls #search { flex: 1; }
+  main { flex: 1; display: grid; grid-template-columns: 1fr; overflow: hidden; }
+  main.with-detail { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
+  #tableWrap { overflow: auto; }
+  #detail { border-left: 1px solid var(--border); overflow: auto; padding: 12px; background: var(--panel); }
+  #detail.hidden { display: none; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { position: sticky; top: 0; background: var(--panel2); padding: 5px 8px;
+    text-align: left; border-bottom: 1px solid var(--border); font-weight: normal;
+    color: var(--muted); user-select: none; z-index: 1; }
+  td { padding: 3px 8px; border-bottom: 1px solid var(--panel2); vertical-align: top;
+    white-space: nowrap; max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
+  tr { cursor: pointer; }
+  tr:hover td { background: #2a2d2e; }
+  tr.selected td { background: #094771; }
+
+  .pill { display: inline-block; padding: 0 6px; border-radius: 8px; background: var(--border);
+    color: var(--muted); font-size: 11px; line-height: 16px; }
+  .pill.system    { background: #5c1a1a; color: #f48771; }
+  .pill.player    { background: #1a3a5c; color: #9cdcfe; }
+  .pill.inventory { background: #2a4a4d; color: #4ec9b0; }
+  .pill.npc       { background: #4d2a4d; color: #ce9178; }
+  .pill.animal    { background: #3a4d2a; color: #b5cea8; }
+  .pill.container { background: #4d3a1a; color: #d7a050; }
+  .pill.station   { background: #3d3d1a; color: #d4d04a; }
+  .pill.building  { background: #4a3d2c; color: #dcdcaa; }
+  .pill.furniture { background: #3a2c4a; color: #c8a8e8; }
+  .pill.vegetation{ background: #2d4a2a; color: #a8d08c; }
+  .pill.region    { background: #2a3a4d; color: #82aaff; }
+  .pill.vehicle   { background: #3a2a2a; color: #c89a8a; }
+  .pill.other     { background: var(--border); color: var(--muted); }
+
+  .muted { color: var(--muted); }
+  .danger { color: var(--danger); }
+  #pagination { padding: 6px 12px; border-top: 1px solid var(--border);
+    display: flex; gap: 8px; align-items: center; background: var(--panel); }
+
+  .detail-section { margin-bottom: 16px; }
+  .detail-section h3 { font-size: 11px; margin: 0 0 6px 0; color: var(--accent);
+    text-transform: uppercase; letter-spacing: 0.7px; font-weight: normal; }
+  .field { display: grid; grid-template-columns: 110px 1fr; gap: 8px; margin-bottom: 4px; align-items: start; }
+  .field label { color: var(--muted); padding-top: 4px; }
+  .field input, .field textarea {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    padding: 3px 6px; font: inherit; width: 100%;
+  }
+  .field textarea { min-height: 60px; }
+  .field.changed input, .field.changed textarea { border-color: var(--warn); background: #2a2520; }
+  .field .span { padding-top: 4px; word-break: break-all; }
+
+  pre.hex { background: var(--bg); border: 1px solid var(--border); padding: 8px;
+    overflow: auto; font-size: 11px; line-height: 1.35; max-height: 360px; margin: 0;
+    white-space: pre; }
+  details { margin-bottom: 8px; }
+  details > summary { cursor: pointer; color: var(--muted); padding: 2px 0; }
+  details > summary:hover { color: var(--text); }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+  .row-actions { display: flex; gap: 6px; align-items: center; }
+
+  .loading { padding: 32px; text-align: center; color: var(--muted); flex: 1; }
+  .loading code { background: var(--panel); padding: 2px 6px; border-radius: 2px; }
+  #changedBadge { color: var(--warn); font-size: 11px; }
+
+  /* Stash dialog. NB: the flex layout must be scoped to [open] so the
+     browser's default `dialog:not([open]) { display: none }` still applies. */
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 0; min-width: 600px; max-width: 90vw; max-height: 85vh; }
+  dialog[open] { display: flex; flex-direction: column; }
+  dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+  dialog header { background: var(--panel2); border-bottom: 1px solid var(--border); padding: 10px 14px; }
+  dialog footer { background: var(--panel2); border-top: 1px solid var(--border);
+    padding: 10px 14px; display: flex; gap: 8px; align-items: center; }
+  #stashList { padding: 12px 14px; overflow-y: auto; flex: 1; }
+  .stash-entry { padding: 10px; border: 1px solid var(--border); border-radius: 3px;
+    margin-bottom: 8px; background: var(--bg); }
+  .stash-header { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; }
+  .stash-label { color: var(--text); font-weight: bold; margin-bottom: 2px; }
+
+  /* Structured property tree */
+  .prop-tree { font-size: 12px; line-height: 1.5; }
+  .prop-row { padding: 1px 0; border-left: 1px solid transparent; }
+  .prop-row:hover { background: #2a2d2e; }
+  .prop-name { color: #9cdcfe; }
+  .prop-type { font-size: 11px; }
+  .prop-val  { color: var(--text); }
+  .prop-val code { background: var(--bg); padding: 0 4px; border-radius: 2px; color: #ce9178; font-size: 11px; }
+  .prop-children { border-left: 1px dotted var(--border); margin-left: 6px; }
+
+  /* Verify results */
+  #verifyDialog .verify-summary { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  #verifyDialog .verify-fail { padding: 6px 10px; border-bottom: 1px solid var(--panel2); font-size: 11px; }
+  #verifyDialog .verify-fail .ser { color: var(--accent); display: inline-block; min-width: 60px; }
+  #verifyDialog .verify-fail .reason { color: var(--warn); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>SOULMASK world.db</h1>
+  <input type="file" id="fileInput" accept=".db,.sqlite,.db3">
+  <span id="status" class="muted"></span>
+  <span class="spacer"></span>
+  <button id="verifyAllBtn" title="Round-trip-decode every blob and report failures" disabled>verify codec</button>
+  <button id="stashBtn" title="Open the row stash">stash (0)</button>
+  <span id="changedBadge"></span>
+  <button id="downloadBtn" class="primary" disabled>Download modified .db</button>
+</header>
+
+<section id="summary" hidden></section>
+
+<section id="controls" hidden>
+  <input type="search" id="search" placeholder="filter (also searches strings inside blobs)">
+  <select id="kindFilter">
+    <option value="">all kinds</option>
+    <option value="system">system rows</option>
+    <option value="player">players (HPlayerState)</option>
+    <option value="inventory">inventories (BindBG)</option>
+    <option value="npc">NPCs</option>
+    <option value="animal">animals</option>
+    <option value="container">containers (chests)</option>
+    <option value="station">stations (workbenches/lights)</option>
+    <option value="building">buildings</option>
+    <option value="furniture">furniture</option>
+    <option value="vegetation">vegetation / farm plots</option>
+    <option value="region">regions (JianZhuPianQu)</option>
+    <option value="vehicle">ships / vehicles</option>
+    <option value="other">other</option>
+  </select>
+  <span id="filterCount" class="muted"></span>
+</section>
+
+<main id="main">
+  <div id="tableWrap">
+    <table id="rowsTable"><thead></thead><tbody></tbody></table>
+  </div>
+  <aside id="detail" class="hidden"></aside>
+</main>
+
+<nav id="pagination" hidden></nav>
+
+<div id="empty" class="loading">
+  <p>Choose a <code>world.db</code> to begin.</p>
+  <p class="muted">This page must be served over HTTP — browsers won't load WASM from <code>file://</code>. Run <code>python -m http.server</code> in this folder, then open <code>http://localhost:8000/</code>.</p>
+</div>
+
+<dialog id="verifyDialog">
+  <header style="display:flex; justify-content:space-between; align-items:center; padding:10px 14px; background:var(--panel2); border-bottom:1px solid var(--border);">
+    <strong>Codec round-trip results</strong>
+    <button id="verifyClose">close</button>
+  </header>
+  <div class="verify-summary" id="verifySummary">Running…</div>
+  <div id="verifyFailures" style="overflow-y:auto; flex:1;"></div>
+</dialog>
+
+<dialog id="stashDialog">
+  <header style="display:flex; justify-content:space-between; align-items:center;">
+    <strong>Row stash</strong>
+    <button id="stashClose">close</button>
+  </header>
+  <div id="stashList"></div>
+  <footer>
+    <button id="stashExport">⤓ export to file</button>
+    <label class="row-actions">
+      <span>⤒ import:</span>
+      <input type="file" id="stashImportInput" accept=".json" style="max-width:240px;">
+    </label>
+    <span class="spacer" style="flex:1;"></span>
+    <button id="stashClear" class="danger">clear all</button>
+  </footer>
+</dialog>
+
+<script src="jswasm/sqlite3.js"></script>
+<script src="js/codec-json.js"></script>
+<script src="js/codec-unreal-properties.js"></script>
+<script src="js/codecs.js"></script>
+<script src="js/steam.js"></script>
+<script src="js/stash.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
