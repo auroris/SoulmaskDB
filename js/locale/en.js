@@ -2,9 +2,10 @@
 /**
  * English catalog. Keys are namespaced:
  *   ui.*    — UI strings we author. Add new keys here as the UI grows.
- *   gloss.* — game-vocab Pinyin → English mapping for translateIdent().
- *             Missing keys fall back to the raw token; add new ones when
- *             you see an unmapped class name in the wild.
+ *   gloss.* — game-vocab Pinyin → English mapping consumed by
+ *             SMDB.classify.translateIdent. Missing keys fall back to the
+ *             raw token; add new ones when you see an unmapped class name
+ *             in the wild.
  *
  * Interpolation uses {placeholders}. Numbers are typically pre-formatted
  * via toLocaleString() at the call site.
@@ -18,6 +19,8 @@ window.SMDB_LOCALES.en = {
   'ui.header.title':                'SOULMASK world.db',
   'ui.header.verifyCodec':          'verify codec',
   'ui.header.verifyCodec.title':    'Round-trip-decode every blob and report failures',
+  'ui.header.scripts':              'scripts',
+  'ui.header.scripts.title':        "Browse distinct actor_script values and what they classify as",
   'ui.header.steamCache':           'Steam cache ({count})',
   'ui.header.steamCache.title':     'Clear locally cached Steam display names (dev affordance)',
   'ui.header.stash':                'stash ({count})',
@@ -30,8 +33,8 @@ window.SMDB_LOCALES.en = {
   'ui.search.placeholder':          'filter (also searches strings inside blobs)',
   'ui.kindFilter.all':              'all kinds',
   'ui.kindFilter.system':           'system rows',
-  'ui.kindFilter.player':           'players (HPlayerState)',
-  'ui.kindFilter.inventory':        'inventories (BindBG)',
+  'ui.kindFilter.player':           'players',
+  'ui.kindFilter.inventory':        'inventories',
   'ui.kindFilter.npc':              'NPCs',
   'ui.kindFilter.animal':           'animals',
   'ui.kindFilter.container':        'containers (chests)',
@@ -60,6 +63,7 @@ window.SMDB_LOCALES.en = {
   'ui.status.stashed':              'stashed row #{serial} as "{label}"',
   'ui.status.replacedFromStash':    'replaced row #{serial} from stash "{label}"',
   'ui.status.pastedAsNew':          'pasted stash "{label}" as new row #{serial}',
+  'ui.status.pastedRenumbered':     'pasted stash "{label}" as new row #{serial} (renumbered to {name})',
   'ui.status.imported':             'imported {count} entries (stash now has {total})',
   'ui.status.sqliteInitFailed':     'sqlite init failed: {message}',
 
@@ -127,9 +131,6 @@ window.SMDB_LOCALES.en = {
   'ui.steam.personaName':           'persona name',
   'ui.steam.avatar':                'avatar',
   'ui.steam.steamid64':             'SteamID64',
-  'ui.steam.steamid3':              'SteamID3',
-  'ui.steam.steamidV1':             'SteamID v1',
-  'ui.steam.accountId':             'account ID',
   'ui.steam.openProfile':           '↗ open Steam profile',
   'ui.steam.savePersona':           'save persona name',
   'ui.steam.placeholder.auto':      '{name}',
@@ -187,6 +188,20 @@ window.SMDB_LOCALES.en = {
   'ui.stash.defaultPlayerLabel':    'Player {id}{suffix}',
   'ui.stash.defaultRowLabel':       '#{serial} {label}',
 
+  // ---------------------------------------------------------- scripts dialog
+  'ui.scripts.heading':             'Scripts in this DB',
+  'ui.scripts.close':                'close',
+  'ui.scripts.unmappedOnly':        "show only unmapped ('other')",
+  'ui.scripts.copyUnmapped':        'copy unmapped to clipboard',
+  'ui.scripts.copiedCount':         'copied {count} unmapped scripts',
+  'ui.scripts.copyFailed':          'copy failed: {message}',
+  'ui.scripts.empty':               '(no scripts match the filter)',
+  'ui.scripts.noScript':            '(no script)',
+  'ui.scripts.summary':             '{distinct} distinct scripts · {unmapped} unmapped',
+  'ui.scripts.headerCount':         '#',
+  'ui.scripts.headerKind':          'kind',
+  'ui.scripts.headerScript':        'actor_script',
+
   // ------------------------------------------------------------ verify dialog
   'ui.verify.heading':              'Codec round-trip results',
   'ui.verify.close':                'close',
@@ -208,8 +223,20 @@ window.SMDB_LOCALES.en = {
   'ui.alert.jsonInvalid':           "won't save: invalid JSON ({message})",
   'ui.alert.loadDbFirst':           'Load a world.db first.',
   'ui.alert.confirmDeleteRow':      'Delete actor_serial={serial}? This will be lost on download. Cancel and Download first if you want a backup.',
-  'ui.alert.confirmReplaceRow':     "A row with actor_name='{name}' already exists in this DB (actor_serial={serial}).\n\nClick OK to REPLACE that row's contents with the stashed data.\nClick Cancel to abort the paste.",
   'ui.alert.confirmClearSteam':     'Clear all {count} cached Steam entries? Everything will be re-fetched on the next save load.',
+  'ui.alert.renumberFailed':        'renumber failed: {message}',
+  'ui.alert.renumberNoSuffix':      "actor_name doesn't end in _<number>, can't renumber",
+  'ui.alert.renumberExhausted':     'gave up looking for a free actor_name after 1,000,000 attempts',
+
+  // ---------------------------------------------------------- collision dialog
+  'ui.collision.heading':           'Row collision',
+  'ui.collision.message':           "A row with actor_name='{name}' already exists in this DB (actor_serial=#{serial}).",
+  'ui.collision.notePlayer':        'This is player save data (HPlayerState). Renumbering would orphan it — only Replace or Cancel.',
+  'ui.collision.noteRenumberable':  'Renumber: walk the trailing _<n> in the actor_name forward until it lands on a free name, then insert as a new row.',
+  'ui.collision.noteNoRenumber':    "This actor_name doesn't end in _<number>, so Renumber isn't available.",
+  'ui.collision.cancel':            'Cancel',
+  'ui.collision.replace':           'Replace existing',
+  'ui.collision.renumber':          'Renumber & paste',
 
   // =========================================================================
   // gloss.* — Pinyin tokens → English. Missing keys fall back to the raw
@@ -238,6 +265,7 @@ window.SMDB_LOCALES.en = {
   'gloss.DaoJu':         'item',
   'gloss.RongQi':        'container',
   'gloss.GuanLiQi':      'manager',
+  'gloss.WenMingGuanLiQi': 'civilization manager',
   'gloss.CaiLiao':       'material',
   'gloss.WuQi':          'weapon',
   'gloss.Wuqi':          'weapon',

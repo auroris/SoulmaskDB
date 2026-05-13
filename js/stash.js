@@ -22,15 +22,18 @@
  *     label:       user-editable short label (shown in UI),
  *     note:        user-editable freeform note,
  *     row: {
- *       server_id, data_version, actor_name, actor_level, actor_script,
+ *       data_version, actor_name, actor_level, actor_script,
  *       actor_owner, actor_transf, actor_time,
  *       actor_data_b64,           // base64 of actor_data, or null
  *       _origSerial               // serial in source DB (informational)
  *     }
  *   }
  *
- * `actor_serial` is intentionally NOT preserved on the row — pasting always
- * lets the destination DB assign a fresh serial via AUTOINCREMENT.
+ * Two columns are intentionally NOT preserved on the row:
+ *   - actor_serial: pasting always lets the destination DB assign a fresh
+ *     serial via AUTOINCREMENT.
+ *   - server_id:    a destination-specific value. The caller is responsible
+ *     for binding the destination DB's server_id when pasting.
  */
 window.SMDB = window.SMDB || {};
 
@@ -38,8 +41,11 @@ SMDB.stash = (() => {
   const FILE_FORMAT = 'soulmaskdb-stash';
   const FILE_VERSION = 1;
 
+  // Columns mirrored into stash entries (and therefore exported JSON).
+  // server_id is excluded — see file header. Callers binding for INSERT/UPDATE
+  // must add it (plus actor_data) explicitly.
   const ROW_COLUMNS = [
-    'server_id', 'data_version', 'actor_name', 'actor_level',
+    'data_version', 'actor_name', 'actor_level',
     'actor_script', 'actor_owner', 'actor_transf', 'actor_time',
   ];
 
@@ -95,11 +101,12 @@ SMDB.stash = (() => {
     };
   }
 
+  // Build the column→value bindings for inserting/updating. server_id is NOT
+  // included here — the caller must merge it in from the destination DB.
   function stashEntryToBindings(entry) {
     const r = entry.row;
     const blob = r.actor_data_b64 ? base64ToUint8(r.actor_data_b64) : null;
     return {
-      server_id:    r.server_id,
       data_version: r.data_version,
       actor_name:   r.actor_name,
       actor_level:  r.actor_level,

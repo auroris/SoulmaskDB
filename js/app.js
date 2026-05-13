@@ -10,87 +10,6 @@
  */
 
 // ============================================================
-// CLASSIFICATION
-// ============================================================
-
-function shortClassName(scriptPath) {
-  if (!scriptPath) return '';
-  const m = scriptPath.match(/[./]([^./]+)_C$/);
-  if (m) return m[1];
-  const parts = scriptPath.split(/[./]/);
-  return parts[parts.length - 1] || scriptPath;
-}
-
-// Romanized-Mandarin Soulmask blueprint identifiers → friendly per-locale
-// words. The gloss table lives in js/locale/{en,zh}.js under the `gloss.*`
-// namespace; missing tokens fall back to the raw token (the right default
-// for new game-introduced names we haven't yet mapped).
-function translateIdent(ident) {
-  if (!ident) return '';
-  const cleaned = ident.replace(/^BP_/, '').replace(/_C$/, '');
-  const parts = cleaned.split(/[_.]/).filter(Boolean);
-  return parts.map(p => SMDB.i18n.t('gloss.' + p, { default: p })).join(' ');
-}
-
-// Order-sensitive: more specific patterns must come BEFORE generic ones.
-function classify(row) {
-  const name = row.actor_name || '';
-  const script = row.actor_script || '';
-
-  if (name === 'GAME_SETTINGS') return { kind: 'system', label: 'GAME_SETTINGS', summary: t('ui.classify.gameSettings') };
-  if (name === 'GAMEMODE')      return { kind: 'system', label: 'GAMEMODE',      summary: t('ui.classify.gameMode') };
-  if (SMDB.steam.isSteamId64(name)) return { kind: 'system', label: name, summary: t('ui.classify.playerSave') };
-
-  const lower = script.toLowerCase();
-  let kind = 'other';
-
-  if      (lower.includes('hplayerstate'))         kind = 'player';
-  else if (lower.includes('bindbgcompactor'))      kind = 'inventory';
-  else if (lower.includes('jianzhupianqu'))        kind = 'region';
-  else if (lower.includes('jianzhu/rongqi')
-       ||  lower.includes('jianzhu/baoguoactor')
-       ||  lower.includes('hbaoxiang'))            kind = 'container';
-  else if (lower.includes('jianzhu/gongzuotai')
-       ||  lower.includes('jianzhu/fengche')
-       ||  lower.includes('jianzhu/lighting')
-       ||  lower.includes('jianzhu/chuansongmen')
-       ||  lower.includes('conveyor'))             kind = 'station';
-  else if (lower.includes('jianzhu/zhongzhi'))     kind = 'vegetation';
-  else if (lower.includes('jianzhu/jiaju'))        kind = 'furniture';
-  else if (lower.includes('animalhouse'))          kind = 'building';
-  else if (lower.includes('jianzhu'))              kind = 'building';
-  else if (lower.includes('/npc/')
-       ||  lower.includes('tribe')
-       ||  lower.includes('savage')
-       ||  lower.includes('sandbandits')
-       ||  lower.includes('desertwolf')
-       ||  lower.includes('exiles'))               kind = 'npc';
-  else if (lower.includes('monster')
-       ||  lower.includes('dongwu'))               kind = 'animal';
-  else if (lower.includes('plant') || lower.includes('crop') || lower.includes('zhibei'))
-                                                   kind = 'vegetation';
-  else if (lower.includes('/ship/')
-       ||  lower.includes('bp_ship')
-       ||  lower.includes('bp_boat')
-       ||  lower.includes('bp_deck')
-       ||  lower.includes('gangway'))              kind = 'vehicle';
-
-  const cls = shortClassName(script);
-  const tx = parseTransform(row.actor_transf);
-  const pos = tx ? ` @ ${tx.pos.map(n => Math.round(n)).join(',')}` : '';
-  return { kind, label: cls, summary: translateIdent(cls) + pos };
-}
-
-function parseTransform(t) {
-  if (!t) return null;
-  const parts = t.split('|');
-  if (parts.length !== 3) return null;
-  const triples = parts.map(p => p.split(',').map(Number));
-  if (triples.some(tr => tr.length !== 3 || tr.some(n => !isFinite(n)))) return null;
-  return { pos: triples[0], rot: triples[1], scale: triples[2] };
-}
-
-// ============================================================
 // SHARED RENDER HELPERS
 // ============================================================
 
@@ -149,6 +68,10 @@ const PAGE_SIZE = 200;
 let selectedSerial = null;
 let dirty = false;
 let currentFileLabel = null;
+// server_id detected from the loaded DB. Used when pasting from stash so
+// inserted rows belong to this server, not whichever server the stash was
+// captured from. See detectServerId() for the lookup strategy.
+let currentServerId = null;
 
 const setStatus = msg => { $('status').textContent = msg || ''; };
 
@@ -186,6 +109,7 @@ function loadBytes(bytes, label) {
 
   currentFileLabel = label;
   loadRows();
+  currentServerId = detectServerId();
   dirty = false;
   selectedSerial = null;
   $('detail').classList.add('hidden');
@@ -227,7 +151,7 @@ function loadRows() {
   });
   setStatus(t('ui.status.indexingBlobs', { count: rows.length.toLocaleString() }));
   for (const r of rows) {
-    const c = classify(r);
+    const c = SMDB.classify.classify(r);
     r._kind = c.kind; r._label = c.label; r._summary = c.summary;
     r._blobText = r.actor_data ? extractBlobText(r.actor_data) : '';
     r.actor_data = null;  // release the blob — kept only the searchable text
@@ -266,6 +190,18 @@ function extractBlobText(blob) {
   return out.toLowerCase();
 }
 
+// world.db: server_id comes from the GAME_SETTINGS row. accounts.db has no
+// such row, so fall back to the first row's server_id — the user will likely
+// need to fix it manually via the editable field, but that's better than
+// inserting NULL.
+function detectServerId() {
+  const fromSettings = db.selectValue(
+    "SELECT server_id FROM actor_table WHERE actor_name = ?", ['GAME_SETTINGS']);
+  if (fromSettings != null) return fromSettings;
+  return db.selectValue(
+    "SELECT server_id FROM actor_table ORDER BY actor_serial LIMIT 1");
+}
+
 function getRowDetail(serial) {
   const rows = [];
   db.exec({
@@ -282,6 +218,7 @@ function markDirty() { dirty = true; updateChrome(); }
 function updateChrome() {
   $('downloadBtn').disabled = !db;
   $('verifyAllBtn').disabled = !db;
+  $('scriptsBtn').disabled = !db;
   $('controls').hidden = !db;
   $('empty').hidden = !!db;
   $('changedBadge').textContent = dirty ? t('ui.header.changedBadge') : '';
@@ -417,7 +354,7 @@ function selectRow(serial) {
 }
 
 function renderDetail(row, summary) {
-  const tx = parseTransform(row.actor_transf);
+  const tx = SMDB.classify.parseTransform(row.actor_transf);
   const blob = row.actor_data;
   const blobLen = blob ? blob.length : 0;
   const decoded = blob ? SMDB.codecs.decode(blob) : null;
@@ -508,9 +445,6 @@ function renderSteamSection(steamid64) {
         <input id="steamLabel" value="${escapeAttr(stored)}" placeholder="${escapeAttr(placeholder)}">
       </div>
       <div class="field"><label>${escapeText(t('ui.steam.steamid64'))}</label><span class="span">${escapeText(s.steamid64)}</span></div>
-      <div class="field"><label>${escapeText(t('ui.steam.steamid3'))}</label><span class="span">${escapeText(s.steamid3)}</span></div>
-      <div class="field"><label>${escapeText(t('ui.steam.steamidV1'))}</label><span class="span">${escapeText(s.steamidV1)}</span></div>
-      <div class="field"><label>${escapeText(t('ui.steam.accountId'))}</label><span class="span">${escapeText(s.accountId)}</span></div>
       <div class="toolbar">
         <a href="${s.profileUrl}" target="_blank" rel="noopener noreferrer">
           <button type="button">${escapeText(t('ui.steam.openProfile'))}</button>
@@ -930,44 +864,126 @@ function editStashEntry(id) {
   renderStashList();
 }
 
-function pasteFromStash(id) {
+// Actor names for spawned objects look like:
+//   /Game/.../BP_DongWu_Yu_C_2146718976
+// The trailing _<number> is the Unreal instance ID; renumbering means
+// incrementing it until the resulting actor_name is free in the destination.
+// System rows (GAME_SETTINGS, GAMEMODE) and player saves (Steam64 IDs) don't
+// match this pattern, so renumber is unavailable for them.
+function canRenumberActorName(name) {
+  return /_\d+$/.test(name || '');
+}
+
+// Walk forward from the existing trailing number until we find an actor_name
+// that doesn't collide in the destination DB. Exported so a future multi-row
+// (base-copy) paste can reuse the same scheme.
+function renumberActorName(name) {
+  const m = (name || '').match(/^(.*_)(\d+)$/);
+  if (!m) throw new Error(t('ui.alert.renumberNoSuffix'));
+  const prefix = m[1];
+  let num = parseInt(m[2], 10);
+  for (let i = 0; i < 1_000_000; i++) {
+    num++;
+    const candidate = prefix + num;
+    if (!db.selectValue('SELECT 1 FROM actor_table WHERE actor_name = ?', [candidate])) {
+      return candidate;
+    }
+  }
+  throw new Error(t('ui.alert.renumberExhausted'));
+}
+
+// Resolves to 'cancel' | 'replace' | 'renumber'. Escape / backdrop dismiss
+// resolves to 'cancel'.
+function showCollisionDialog({ name, existingSerial, isPlayerData, allowRenumber }) {
+  return new Promise(resolve => {
+    const dlg = $('collisionDialog');
+    $('collisionMessage').textContent = t('ui.collision.message', { name, serial: existingSerial });
+    let noteKey;
+    if (isPlayerData)         noteKey = 'ui.collision.notePlayer';
+    else if (allowRenumber)   noteKey = 'ui.collision.noteRenumberable';
+    else                      noteKey = 'ui.collision.noteNoRenumber';
+    $('collisionNote').textContent = t(noteKey);
+    $('collisionRenumber').hidden = !allowRenumber;
+
+    let result = 'cancel';
+    const onCancel   = () => { result = 'cancel';   dlg.close(); };
+    const onReplace  = () => { result = 'replace';  dlg.close(); };
+    const onRenumber = () => { result = 'renumber'; dlg.close(); };
+    const onClose    = () => {
+      $('collisionCancel')  .removeEventListener('click', onCancel);
+      $('collisionReplace') .removeEventListener('click', onReplace);
+      $('collisionRenumber').removeEventListener('click', onRenumber);
+      dlg.removeEventListener('close', onClose);
+      resolve(result);
+    };
+    $('collisionCancel')  .addEventListener('click', onCancel);
+    $('collisionReplace') .addEventListener('click', onReplace);
+    $('collisionRenumber').addEventListener('click', onRenumber);
+    dlg.addEventListener('close', onClose);
+    dlg.showModal();
+  });
+}
+
+async function pasteFromStash(id) {
   if (!db) { alert(t('ui.alert.loadDbFirst')); return; }
   const entry = SMDB.stash.get(id);
   if (!entry) return;
-  const bindings = SMDB.stash.stashEntryToBindings(entry);
 
-  // Conflict on actor_name (the unique index).
+  // Destination DB owns server_id — stash never carries it across.
+  const bindings = SMDB.stash.stashEntryToBindings(entry);
+  bindings.server_id = currentServerId;
+
+  const cols = [...SMDB.stash.ROW_COLUMNS, 'actor_data', 'server_id'];
+
   let existingSerial = null;
   if (bindings.actor_name) {
-    existingSerial = db.selectValue('SELECT actor_serial FROM actor_table WHERE actor_name = ?', [bindings.actor_name]);
+    existingSerial = db.selectValue(
+      'SELECT actor_serial FROM actor_table WHERE actor_name = ?', [bindings.actor_name]);
   }
 
   if (existingSerial) {
-    const ok = confirm(t('ui.alert.confirmReplaceRow', { name: bindings.actor_name, serial: existingSerial }));
-    if (!ok) return;
-    const cols = SMDB.stash.ROW_COLUMNS.concat(['actor_data']);
+    const isPlayerData = SMDB.classify.isPlayerRow(entry.row);
+    const allowRenumber = !isPlayerData && canRenumberActorName(bindings.actor_name);
+    const action = await showCollisionDialog({
+      name: bindings.actor_name,
+      existingSerial,
+      isPlayerData,
+      allowRenumber,
+    });
+
+    if (action === 'cancel') return;
+
+    if (action === 'replace') {
+      try {
+        db.exec({
+          sql: `UPDATE actor_table SET ${cols.map(c => `${c} = ?`).join(', ')} WHERE actor_serial = ?`,
+          bind: [...cols.map(c => bindings[c]), existingSerial],
+        });
+      } catch (e) { alert(t('ui.alert.replaceFailed', { message: e.message })); return; }
+      markDirty(); loadRows(); applyFilters();
+      setStatus(t('ui.status.replacedFromStash', { serial: existingSerial, label: entry.label }));
+      selectRow(existingSerial);
+      $('stashDialog').close();
+      return;
+    }
+
+    // action === 'renumber' — fall through to INSERT with a fresh actor_name.
     try {
-      db.exec({
-        sql: `UPDATE actor_table SET ${cols.map(c => `${c} = ?`).join(', ')} WHERE actor_serial = ?`,
-        bind: [...cols.map(c => bindings[c]), existingSerial],
-      });
-    } catch (e) { alert(t('ui.alert.replaceFailed', { message: e.message })); return; }
-    markDirty(); loadRows(); applyFilters();
-    setStatus(t('ui.status.replacedFromStash', { serial: existingSerial, label: entry.label }));
-    selectRow(existingSerial);
-  } else {
-    const cols = SMDB.stash.ROW_COLUMNS.concat(['actor_data']);
-    try {
-      db.exec({
-        sql: `INSERT INTO actor_table (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
-        bind: cols.map(c => bindings[c]),
-      });
-    } catch (e) { alert(t('ui.alert.insertFailed', { message: e.message })); return; }
-    const newSerial = db.selectValue('SELECT last_insert_rowid()');
-    markDirty(); loadRows(); applyFilters();
-    setStatus(t('ui.status.pastedAsNew', { label: entry.label, serial: newSerial }));
-    selectRow(newSerial);
+      bindings.actor_name = renumberActorName(bindings.actor_name);
+    } catch (e) { alert(t('ui.alert.renumberFailed', { message: e.message })); return; }
   }
+
+  try {
+    db.exec({
+      sql: `INSERT INTO actor_table (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
+      bind: cols.map(c => bindings[c]),
+    });
+  } catch (e) { alert(t('ui.alert.insertFailed', { message: e.message })); return; }
+  const newSerial = db.selectValue('SELECT last_insert_rowid()');
+  markDirty(); loadRows(); applyFilters();
+  const statusKey = existingSerial ? 'ui.status.pastedRenumbered' : 'ui.status.pastedAsNew';
+  setStatus(t(statusKey, { label: entry.label, serial: newSerial, name: bindings.actor_name }));
+  selectRow(newSerial);
   $('stashDialog').close();
 }
 
@@ -1069,6 +1085,77 @@ async function runVerifyAll() {
 }
 
 // ============================================================
+// SCRIPTS DIAGNOSTIC
+// ============================================================
+//
+// Browse distinct actor_script values in the loaded DB, see which kind
+// each maps to, and copy the ones still landing in 'other' back as input
+// for new rules in SMDB.classify.RULES.
+
+let scriptsUnmappedOnly = false;
+
+function openScriptsDialog() {
+  if (!db) return;
+  scriptsUnmappedOnly = $('scriptsFilterUnmapped').checked;
+  renderScriptsList();
+  $('scriptsDialog').showModal();
+}
+
+function renderScriptsList() {
+  const all = SMDB.classify.aggregateScripts(allRows);
+  const unmappedCount = all.filter(s => s.kind === 'other').length;
+  const shown = (scriptsUnmappedOnly ? all.filter(s => s.kind === 'other') : all)
+    .slice()
+    .sort((a, b) => {
+      // 'other' first within the current view, then count desc.
+      if ((a.kind === 'other') !== (b.kind === 'other')) return a.kind === 'other' ? -1 : 1;
+      return b.count - a.count;
+    });
+
+  $('scriptsSummary').textContent = t('ui.scripts.summary', {
+    distinct: all.length.toLocaleString(),
+    unmapped: unmappedCount.toLocaleString(),
+  });
+  $('scriptsCopyUnmapped').disabled = unmappedCount === 0;
+
+  const body = $('scriptsList');
+  if (shown.length === 0) {
+    body.innerHTML = `<div class="muted" style="padding:20px; text-align:center;">${escapeText(t('ui.scripts.empty'))}</div>`;
+    return;
+  }
+  body.innerHTML = `
+    <table>
+      <thead><tr>
+        <th style="text-align:right;">${escapeText(t('ui.scripts.headerCount'))}</th>
+        <th>${escapeText(t('ui.scripts.headerKind'))}</th>
+        <th>${escapeText(t('ui.scripts.headerScript'))}</th>
+      </tr></thead>
+      <tbody>${shown.map(s => `
+        <tr>
+          <td class="count">${s.count.toLocaleString()}</td>
+          <td class="kind"><span class="pill ${s.kind}">${escapeText(t('ui.kind.' + s.kind, { default: s.kind }))}</span></td>
+          <td>${escapeText(s.script || t('ui.scripts.noScript'))}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+async function copyUnmappedScripts() {
+  const all = SMDB.classify.aggregateScripts(allRows);
+  const unmapped = all.filter(s => s.kind === 'other').sort((a, b) => b.count - a.count);
+  if (unmapped.length === 0) return;
+  // Plain text, "<count>\t<script>" per line — readable and machine-parseable.
+  const text = unmapped.map(s => `${s.count}\t${s.script}`).join('\n');
+  try {
+    await navigator.clipboard.writeText(text);
+    $('scriptsCopyStatus').textContent = t('ui.scripts.copiedCount', { count: unmapped.length });
+  } catch (e) {
+    $('scriptsCopyStatus').textContent = t('ui.scripts.copyFailed', { message: e.message });
+  }
+  setTimeout(() => { $('scriptsCopyStatus').textContent = ''; }, 4000);
+}
+
+// ============================================================
 // DOWNLOAD
 // ============================================================
 
@@ -1105,6 +1192,14 @@ $('downloadBtn').addEventListener('click', downloadDB);
 
 $('verifyAllBtn').addEventListener('click', runVerifyAll);
 $('verifyClose').addEventListener('click', () => $('verifyDialog').close());
+
+$('scriptsBtn').addEventListener('click', openScriptsDialog);
+$('scriptsClose').addEventListener('click', () => $('scriptsDialog').close());
+$('scriptsFilterUnmapped').addEventListener('change', () => {
+  scriptsUnmappedOnly = $('scriptsFilterUnmapped').checked;
+  renderScriptsList();
+});
+$('scriptsCopyUnmapped').addEventListener('click', copyUnmappedScripts);
 
 $('steamCacheBtn').addEventListener('click', () => {
   const n = SMDB.steam.cacheCount();
