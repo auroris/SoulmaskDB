@@ -1,2 +1,7 @@
 /sqlite-wasm-3530100
 *.db
+/node_modules
+/_site
+package-lock.json
+.dev.vars
+/.wrangler

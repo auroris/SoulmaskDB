@@ -1,6 +1,6 @@
 'use strict';
 /**
- * Row stash — localStorage-backed clipboard for whole actor_table rows.
+ * Row stash — in-memory clipboard for whole actor_table rows.
  *
  * Use cases:
  *   - Lift per-player save rows (the Steam-ID HPlayerState entries) out of
@@ -9,9 +9,10 @@
  *   - Snapshot rows before destructive edits.
  *   - Carry rows between sessions / machines via Export to JSON file.
  *
- * Storage: localStorage. Each entry is JSON-serializable with the blob
- * base64-encoded. Limit is ~5MB per origin; a handful of player saves at
- * ~50KB each fit comfortably. For larger bundles, use export-to-file.
+ * Storage: in-memory only — the stash is wiped on page reload. Multi-row
+ * stashes can easily exceed localStorage's ~5MB per-origin cap, and we'd
+ * rather not have stashes that sometimes survive and sometimes don't.
+ * For anything worth keeping, use Export to JSON; restore with Import.
  *
  * Entries:
  *   {
@@ -34,7 +35,6 @@
 window.SMDB = window.SMDB || {};
 
 SMDB.stash = (() => {
-  const KEY = 'soulmaskdb.stash.v1';
   const FILE_FORMAT = 'soulmaskdb-stash';
   const FILE_VERSION = 1;
 
@@ -42,6 +42,9 @@ SMDB.stash = (() => {
     'server_id', 'data_version', 'actor_name', 'actor_level',
     'actor_script', 'actor_owner', 'actor_transf', 'actor_time',
   ];
+
+  // In-memory only. Lost on page reload — use export/import for persistence.
+  let entries = [];
 
   function uuid() {
     if (crypto.randomUUID) return crypto.randomUUID();
@@ -52,27 +55,16 @@ SMDB.stash = (() => {
     return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;
   }
 
-  function load() {
-    try { return JSON.parse(localStorage.getItem(KEY) || '[]'); }
-    catch { return []; }
-  }
-
-  function save(entries) {
-    localStorage.setItem(KEY, JSON.stringify(entries));
-  }
-
-  function count() { return load().length; }
-  function list()  { return load(); }
-  function get(id) { return load().find(e => e.id === id) || null; }
-  function remove(id) { save(load().filter(e => e.id !== id)); }
-  function clear() { save([]); }
+  function count() { return entries.length; }
+  function list()  { return entries; }
+  function get(id) { return entries.find(e => e.id === id) || null; }
+  function remove(id) { entries = entries.filter(e => e.id !== id); }
+  function clear() { entries = []; }
 
   function update(id, patch) {
-    const all = load();
-    const i = all.findIndex(e => e.id === id);
+    const i = entries.findIndex(e => e.id === id);
     if (i < 0) return false;
-    all[i] = { ...all[i], ...patch };
-    save(all);
+    entries[i] = { ...entries[i], ...patch };
     return true;
   }
 
@@ -139,9 +131,7 @@ SMDB.stash = (() => {
   }
 
   function add(entry) {
-    const all = load();
-    all.unshift(entry);
-    save(all);
+    entries.unshift(entry);
     return entry;
   }
 
@@ -152,7 +142,7 @@ SMDB.stash = (() => {
       format: FILE_FORMAT,
       version: FILE_VERSION,
       exportedAt: new Date().toISOString(),
-      entries: load(),
+      entries,
     }, null, 2);
     return new Blob([data], { type: 'application/json' });
   }
@@ -164,16 +154,13 @@ SMDB.stash = (() => {
     }
     if (!Array.isArray(parsed.entries)) throw new Error('Stash file missing `entries` array');
     const incoming = parsed.entries;
-    let next;
     if (mode === 'replace') {
-      next = incoming;
+      entries = incoming;
     } else {
-      const existing = load();
-      const knownIds = new Set(existing.map(e => e.id));
-      next = existing.concat(incoming.filter(e => !knownIds.has(e.id)));
+      const knownIds = new Set(entries.map(e => e.id));
+      entries = entries.concat(incoming.filter(e => !knownIds.has(e.id)));
     }
-    save(next);
-    return { imported: incoming.length, total: next.length };
+    return { imported: incoming.length, total: entries.length };
   }
 
   return {

@@ -1,0 +1,9 @@
+# Local development env for `wrangler pages dev .`
+# Copy to `.dev.vars` (which is gitignored — see .gitignore) and fill in.
+
+# Steam Web API key — get one at https://steamcommunity.com/dev/apikey
+STEAM_API_KEY=your_steam_web_api_key_here
+
+# CORS allowed origin. Wrangler Pages dev serves on port 8788 by default.
+# In production, set this in the Cloudflare Pages dashboard to your deployed origin.
+ALLOWED_ORIGIN=http://localhost:8788

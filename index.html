@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Soulmask world.db browser</title>
+<title data-i18n="ui.title">Soulmask world.db browser</title>
 <style>
   :root {
     --bg: #1e1e1e;
@@ -150,35 +150,37 @@
 <body>
 
 <header>
-  <h1>SOULMASK world.db</h1>
+  <h1 data-i18n="ui.header.title">SOULMASK world.db</h1>
   <input type="file" id="fileInput" accept=".db,.sqlite,.db3">
   <span id="status" class="muted"></span>
   <span class="spacer"></span>
-  <button id="verifyAllBtn" title="Round-trip-decode every blob and report failures" disabled>verify codec</button>
-  <button id="stashBtn" title="Open the row stash">stash (0)</button>
+  <select id="langSelect" data-i18n-title="ui.header.language" title="Language"></select>
+  <button id="verifyAllBtn" data-i18n="ui.header.verifyCodec" data-i18n-title="ui.header.verifyCodec.title" title="Round-trip-decode every blob and report failures" disabled>verify codec</button>
+  <button id="steamCacheBtn" data-i18n-title="ui.header.steamCache.title" title="Clear locally cached Steam display names (dev affordance)" disabled>Steam cache (0)</button>
+  <button id="stashBtn" data-i18n-title="ui.header.stash.title" title="Open the row stash">stash (0)</button>
   <span id="changedBadge"></span>
-  <button id="downloadBtn" class="primary" disabled>Download modified .db</button>
+  <button id="downloadBtn" class="primary" data-i18n="ui.header.download" disabled>Download modified .db</button>
 </header>
 
 <section id="summary" hidden></section>
 
 <section id="controls" hidden>
-  <input type="search" id="search" placeholder="filter (also searches strings inside blobs)">
+  <input type="search" id="search" data-i18n-placeholder="ui.search.placeholder" placeholder="filter (also searches strings inside blobs)">
   <select id="kindFilter">
-    <option value="">all kinds</option>
-    <option value="system">system rows</option>
-    <option value="player">players (HPlayerState)</option>
-    <option value="inventory">inventories (BindBG)</option>
-    <option value="npc">NPCs</option>
-    <option value="animal">animals</option>
-    <option value="container">containers (chests)</option>
-    <option value="station">stations (workbenches/lights)</option>
-    <option value="building">buildings</option>
-    <option value="furniture">furniture</option>
-    <option value="vegetation">vegetation / farm plots</option>
-    <option value="region">regions (JianZhuPianQu)</option>
-    <option value="vehicle">ships / vehicles</option>
-    <option value="other">other</option>
+    <option value=""           data-i18n="ui.kindFilter.all">all kinds</option>
+    <option value="system"     data-i18n="ui.kindFilter.system">system rows</option>
+    <option value="player"     data-i18n="ui.kindFilter.player">players (HPlayerState)</option>
+    <option value="inventory"  data-i18n="ui.kindFilter.inventory">inventories (BindBG)</option>
+    <option value="npc"        data-i18n="ui.kindFilter.npc">NPCs</option>
+    <option value="animal"     data-i18n="ui.kindFilter.animal">animals</option>
+    <option value="container"  data-i18n="ui.kindFilter.container">containers (chests)</option>
+    <option value="station"    data-i18n="ui.kindFilter.station">stations (workbenches/lights)</option>
+    <option value="building"   data-i18n="ui.kindFilter.building">buildings</option>
+    <option value="furniture"  data-i18n="ui.kindFilter.furniture">furniture</option>
+    <option value="vegetation" data-i18n="ui.kindFilter.vegetation">vegetation / farm plots</option>
+    <option value="region"     data-i18n="ui.kindFilter.region">regions (JianZhuPianQu)</option>
+    <option value="vehicle"    data-i18n="ui.kindFilter.vehicle">ships / vehicles</option>
+    <option value="other"      data-i18n="ui.kindFilter.other">other</option>
   </select>
   <span id="filterCount" class="muted"></span>
 </section>
@@ -193,33 +195,32 @@
 <nav id="pagination" hidden></nav>
 
 <div id="empty" class="loading">
-  <p>Choose a <code>world.db</code> to begin.</p>
-  <p class="muted">This page must be served over HTTP — browsers won't load WASM from <code>file://</code>. Run <code>python -m http.server</code> in this folder, then open <code>http://localhost:8000/</code>.</p>
+  <p data-i18n-html="ui.empty.choose">Choose a <code>world.db</code> to begin.</p>
 </div>
 
 <dialog id="verifyDialog">
   <header style="display:flex; justify-content:space-between; align-items:center; padding:10px 14px; background:var(--panel2); border-bottom:1px solid var(--border);">
-    <strong>Codec round-trip results</strong>
-    <button id="verifyClose">close</button>
+    <strong data-i18n="ui.verify.heading">Codec round-trip results</strong>
+    <button id="verifyClose" data-i18n="ui.verify.close">close</button>
   </header>
-  <div class="verify-summary" id="verifySummary">Running…</div>
+  <div class="verify-summary" id="verifySummary" data-i18n="ui.verify.running">Running…</div>
   <div id="verifyFailures" style="overflow-y:auto; flex:1;"></div>
 </dialog>
 
 <dialog id="stashDialog">
   <header style="display:flex; justify-content:space-between; align-items:center;">
-    <strong>Row stash</strong>
-    <button id="stashClose">close</button>
+    <strong data-i18n="ui.stash.heading">Row stash</strong>
+    <button id="stashClose" data-i18n="ui.stash.close">close</button>
   </header>
   <div id="stashList"></div>
   <footer>
-    <button id="stashExport">⤓ export to file</button>
+    <button id="stashExport" data-i18n="ui.stash.export">⤓ export to file</button>
     <label class="row-actions">
-      <span>⤒ import:</span>
+      <span data-i18n="ui.stash.importLabel">⤒ import:</span>
       <input type="file" id="stashImportInput" accept=".json" style="max-width:240px;">
     </label>
     <span class="spacer" style="flex:1;"></span>
-    <button id="stashClear" class="danger">clear all</button>
+    <button id="stashClear" class="danger" data-i18n="ui.stash.clear">clear all</button>
   </footer>
 </dialog>
 
@@ -227,6 +228,9 @@
 <script src="js/codec-json.js"></script>
 <script src="js/codec-unreal-properties.js"></script>
 <script src="js/codecs.js"></script>
+<script src="js/locale/en.js"></script>
+<script src="js/locale/zh.js"></script>
+<script src="js/i18n.js"></script>
 <script src="js/steam.js"></script>
 <script src="js/stash.js"></script>
 <script src="js/app.js"></script>

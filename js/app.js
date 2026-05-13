@@ -2,32 +2,16 @@
 /**
  * Main UI for the Soulmask world.db browser.
  *
- * Loads on top of: sqlite3.js, codec-json, codec-unreal-blob, codecs,
- * steam, stash. All cross-module state lives on `SMDB.*`.
+ * Loads on top of: sqlite3.js, codec-json, codec-unreal-properties, codecs,
+ * locale catalogs (js/locale/*.js), i18n, steam, stash. All cross-module
+ * state lives on `SMDB.*`. User-visible strings go through `t(key, opts?)`
+ * (a file-scope alias for SMDB.i18n.t); the catalogs in js/locale/ are the
+ * single source of truth for what to render in each language.
  */
 
 // ============================================================
 // CLASSIFICATION
 // ============================================================
-
-// Approximate gloss for romanized-Mandarin Soulmask blueprint identifiers.
-// Best-effort and partial — many terms overlap or have multiple meanings.
-const GLOSS = {
-  JianZhu: 'building', PianQu: 'region', JingJiChang: 'farmland',
-  DongWu: 'animal', YeZhu: 'wild boar', XieZi: 'scorpion', Yu: 'fish', Niao: 'bird',
-  ZhiBei: 'vegetation', ZhiWu: 'plant', YouMiao: 'seedling', ShengZhang: 'growth',
-  ZhongZhi: 'farm plot', GengDi: 'tilled ground',
-  Crop: 'crop', Plant: 'plant', Tree: 'tree',
-  BindBG: 'inventory', BaoGuo: 'inventory', BaoXiang: 'chest',
-  DaoJu: 'item', RongQi: 'container', GuanLiQi: 'manager',
-  CaiLiao: 'material', WuQi: 'weapon', Wuqi: 'weapon',
-  FangJu: 'armor', ZhuangBei: 'equipment', JiNeng: 'skill',
-  Tribe: 'tribe', Savage: 'savage', Egypt: 'egypt-DLC',
-  YuanXing: 'prototype', QiTa: 'misc', Comp: 'component', Component: 'component',
-  Actor: 'actor', LBis: 'ibis', NPC: 'NPC', Monster: 'monster',
-  GongZuoTai: 'workbench', JiaJu: 'furniture', FengChe: 'windmill',
-  ChuanSongMen: 'portal', Lighting: 'lighting', Conveyor: 'conveyor',
-};
 
 function shortClassName(scriptPath) {
   if (!scriptPath) return '';
@@ -37,11 +21,15 @@ function shortClassName(scriptPath) {
   return parts[parts.length - 1] || scriptPath;
 }
 
+// Romanized-Mandarin Soulmask blueprint identifiers → friendly per-locale
+// words. The gloss table lives in js/locale/{en,zh}.js under the `gloss.*`
+// namespace; missing tokens fall back to the raw token (the right default
+// for new game-introduced names we haven't yet mapped).
 function translateIdent(ident) {
   if (!ident) return '';
   const cleaned = ident.replace(/^BP_/, '').replace(/_C$/, '');
   const parts = cleaned.split(/[_.]/).filter(Boolean);
-  return parts.map(p => GLOSS[p] || p).join(' ');
+  return parts.map(p => SMDB.i18n.t('gloss.' + p, { default: p })).join(' ');
 }
 
 // Order-sensitive: more specific patterns must come BEFORE generic ones.
@@ -49,9 +37,9 @@ function classify(row) {
   const name = row.actor_name || '';
   const script = row.actor_script || '';
 
-  if (name === 'GAME_SETTINGS') return { kind: 'system', label: 'GAME_SETTINGS', summary: 'Server: applied MODs (JSON blob)' };
-  if (name === 'GAMEMODE')      return { kind: 'system', label: 'GAMEMODE',      summary: 'Server: global item-cap registry' };
-  if (SMDB.steam.isSteamId64(name)) return { kind: 'system', label: name, summary: 'Per-player save data (Steam64 ID)' };
+  if (name === 'GAME_SETTINGS') return { kind: 'system', label: 'GAME_SETTINGS', summary: t('ui.classify.gameSettings') };
+  if (name === 'GAMEMODE')      return { kind: 'system', label: 'GAMEMODE',      summary: t('ui.classify.gameMode') };
+  if (SMDB.steam.isSteamId64(name)) return { kind: 'system', label: name, summary: t('ui.classify.playerSave') };
 
   const lower = script.toLowerCase();
   let kind = 'other';
@@ -107,6 +95,7 @@ function parseTransform(t) {
 // ============================================================
 
 const $ = id => document.getElementById(id);
+const t = SMDB.i18n.t;  // file-scope alias for terse call sites
 
 function escapeText(s) {
   return String(s ?? '').replace(/[&<>"']/g, c =>
@@ -165,18 +154,18 @@ const setStatus = msg => { $('status').textContent = msg || ''; };
 
 async function bootSqlite() {
   if (sqlite3) return sqlite3;
-  setStatus('initializing sqlite…');
+  setStatus(t('ui.status.initSqlite'));
   sqlite3 = await globalThis.sqlite3InitModule({
     print: (...a) => console.log('[sqlite3]', ...a),
     printErr: (...a) => console.warn('[sqlite3]', ...a),
   });
-  setStatus('sqlite ' + sqlite3.capi.sqlite3_libversion());
+  setStatus(t('ui.status.sqliteReady', { version: sqlite3.capi.sqlite3_libversion() }));
   return sqlite3;
 }
 
 async function loadFile(file) {
   await bootSqlite();
-  setStatus(`loading ${file.name} (${fmtBytes(file.size)})…`);
+  setStatus(t('ui.status.loadingFile', { file: file.name, size: fmtBytes(file.size) }));
   const bytes = new Uint8Array(await file.arrayBuffer());
   loadBytes(bytes, file.name);
 }
@@ -191,7 +180,7 @@ function loadBytes(bytes, label) {
   if (!hasTable) {
     db.close(); db = null;
     setStatus('');
-    alert(`${label}: not a Soulmask world.db (no actor_table)`);
+    alert(t('ui.alert.notSoulmaskDB', { file: label }));
     return;
   }
 
@@ -203,7 +192,23 @@ function loadBytes(bytes, label) {
   $('main').classList.remove('with-detail');
   updateChrome();
   applyFilters();
-  setStatus(`loaded ${label} — ${allRows.length.toLocaleString()} rows`);
+  setStatus(t('ui.status.loaded', { file: label, count: allRows.length.toLocaleString() }));
+  resolvePlayerNames();
+}
+
+// Fire-and-forget Steam-name resolution after a save loads. On success,
+// re-renders the table so resolved names appear in the row list. Errors
+// (404, CORS, offline, etc.) are silently swallowed by SMDB.steam.resolveNames
+// — the existing manual-label flow remains the fallback.
+function resolvePlayerNames() {
+  const ids = [];
+  for (const r of allRows) {
+    if (SMDB.steam.isSteamId64(r.actor_name)) ids.push(r.actor_name);
+  }
+  if (ids.length === 0) return;
+  SMDB.steam.resolveNames(ids).then(updated => {
+    if (updated > 0) { renderTable(); updateChrome(); }
+  });
 }
 
 function loadRows() {
@@ -211,7 +216,7 @@ function loadRows() {
   // We drop the actor_data reference after extracting strings to keep
   // memory bounded.
   const rows = [];
-  setStatus('loading rows…');
+  setStatus(t('ui.status.loadingRows'));
   db.exec({
     sql: `SELECT actor_serial, server_id, data_version, actor_name, actor_script,
                  actor_owner, actor_transf, actor_time, actor_data,
@@ -220,7 +225,7 @@ function loadRows() {
     rowMode: 'object',
     resultRows: rows,
   });
-  setStatus(`indexing blob strings (${rows.length.toLocaleString()} rows)…`);
+  setStatus(t('ui.status.indexingBlobs', { count: rows.length.toLocaleString() }));
   for (const r of rows) {
     const c = classify(r);
     r._kind = c.kind; r._label = c.label; r._summary = c.summary;
@@ -279,8 +284,11 @@ function updateChrome() {
   $('verifyAllBtn').disabled = !db;
   $('controls').hidden = !db;
   $('empty').hidden = !!db;
-  $('changedBadge').textContent = dirty ? '● unsaved changes' : '';
-  $('stashBtn').textContent = `stash (${SMDB.stash.count()})`;
+  $('changedBadge').textContent = dirty ? t('ui.header.changedBadge') : '';
+  $('stashBtn').textContent = t('ui.header.stash', { count: SMDB.stash.count() });
+  const cacheN = SMDB.steam.cacheCount();
+  $('steamCacheBtn').textContent = t('ui.header.steamCache', { count: cacheN });
+  $('steamCacheBtn').disabled = cacheN === 0;
   if (db) renderSummary();
 }
 
@@ -313,12 +321,17 @@ function renderTable() {
 
   thead.innerHTML = `
     <tr>
-      <th>#</th><th>kind</th><th>class</th><th>summary</th>
-      <th>owner</th><th>blob</th><th>time</th>
+      <th>${escapeText(t('ui.tableHeader.serial'))}</th>
+      <th>${escapeText(t('ui.tableHeader.kind'))}</th>
+      <th>${escapeText(t('ui.tableHeader.class'))}</th>
+      <th>${escapeText(t('ui.tableHeader.summary'))}</th>
+      <th>${escapeText(t('ui.tableHeader.owner'))}</th>
+      <th>${escapeText(t('ui.tableHeader.blob'))}</th>
+      <th>${escapeText(t('ui.tableHeader.time'))}</th>
     </tr>`;
 
   if (slice.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="7" class="muted" style="padding: 16px;">no rows match</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="muted" style="padding: 16px;">${escapeText(t('ui.tableEmpty'))}</td></tr>`;
   } else {
     tbody.innerHTML = slice.map(r => {
       const nameLabel = SMDB.steam.isSteamId64(r.actor_name) ? steamShortLabel(r.actor_name) : '';
@@ -328,7 +341,7 @@ function renderTable() {
       return `
       <tr data-serial="${r.actor_serial}" class="${r.actor_serial === selectedSerial ? 'selected' : ''}">
         <td>${r.actor_serial}</td>
-        <td><span class="pill ${r._kind}">${r._kind}</span></td>
+        <td><span class="pill ${r._kind}">${escapeText(t('ui.kind.' + r._kind, {default: r._kind}))}</span></td>
         <td title="${escapeAttr(r.actor_script || '')}">${labelHtml}</td>
         <td title="${escapeAttr(r._summary || '')}">${escapeText(r._summary)}</td>
         <td class="muted" title="${escapeAttr(r.actor_owner || '')}">${escapeText(r.actor_owner || '')}</td>
@@ -342,8 +355,10 @@ function renderTable() {
     tr.addEventListener('click', () => selectRow(parseInt(tr.dataset.serial, 10)));
   });
 
-  $('filterCount').textContent =
-    `${filtered.length.toLocaleString()} / ${allRows.length.toLocaleString()} rows`;
+  $('filterCount').textContent = t('ui.filterCount', {
+    shown: filtered.length.toLocaleString(),
+    total: allRows.length.toLocaleString(),
+  });
 
   renderPagination();
 }
@@ -354,11 +369,11 @@ function renderPagination() {
   if (total === 0) { $('pagination').hidden = true; return; }
   $('pagination').hidden = false;
   $('pagination').innerHTML = `
-    <button id="firstPage" ${currentPage === 0 ? 'disabled' : ''}>« first</button>
-    <button id="prevPage"  ${currentPage === 0 ? 'disabled' : ''}>‹ prev</button>
-    <span class="muted">page ${currentPage + 1} of ${pages}</span>
-    <button id="nextPage"  ${currentPage >= pages - 1 ? 'disabled' : ''}>next ›</button>
-    <button id="lastPage"  ${currentPage >= pages - 1 ? 'disabled' : ''}>last »</button>
+    <button id="firstPage" ${currentPage === 0 ? 'disabled' : ''}>${escapeText(t('ui.pagination.first'))}</button>
+    <button id="prevPage"  ${currentPage === 0 ? 'disabled' : ''}>${escapeText(t('ui.pagination.prev'))}</button>
+    <span class="muted">${escapeText(t('ui.pagination.pageOf', { page: currentPage + 1, pages }))}</span>
+    <button id="nextPage"  ${currentPage >= pages - 1 ? 'disabled' : ''}>${escapeText(t('ui.pagination.next'))}</button>
+    <button id="lastPage"  ${currentPage >= pages - 1 ? 'disabled' : ''}>${escapeText(t('ui.pagination.last'))}</button>
   `;
   $('firstPage')?.addEventListener('click', () => { currentPage = 0; renderTable(); });
   $('prevPage') ?.addEventListener('click', () => { currentPage--;   renderTable(); });
@@ -371,17 +386,16 @@ function renderSummary() {
   for (const r of allRows) counts[r._kind] = (counts[r._kind] || 0) + 1;
   const order = ['system', 'player', 'inventory', 'npc', 'animal', 'container', 'station', 'building', 'furniture', 'vegetation', 'region', 'vehicle', 'other'];
   $('summary').innerHTML = `
-    <div class="stat"><span class="muted">total</span><b>${allRows.length.toLocaleString()}</b></div>
+    <div class="stat"><span class="muted">${escapeText(t('ui.summary.total'))}</span><b>${allRows.length.toLocaleString()}</b></div>
     ${order.filter(k => counts[k]).map(k => `
-      <div class="stat"><span class="pill ${k}">${k}</span><b>${counts[k].toLocaleString()}</b></div>
+      <div class="stat"><span class="pill ${k}">${escapeText(t('ui.kind.' + k, {default: k}))}</span><b>${counts[k].toLocaleString()}</b></div>
     `).join('')}
   `;
   $('summary').hidden = false;
 }
 
 function steamShortLabel(steamid64) {
-  const stored = SMDB.steam.getLabel(steamid64);
-  return stored || '';
+  return SMDB.steam.displayName(steamid64) || '';
 }
 
 // ============================================================
@@ -423,23 +437,23 @@ function renderDetail(row, summary) {
   // ---- transform ----
   const txHtml = tx ? `
     <div class="detail-section">
-      <h3>Transform (parsed)</h3>
-      <div class="field"><label>position</label><span class="span">${tx.pos.map(n => n.toFixed(2)).join(', ')}</span></div>
-      <div class="field"><label>rotation</label><span class="span">${tx.rot.map(n => n.toFixed(2)).join(', ')}</span></div>
-      <div class="field"><label>scale</label><span class="span">${tx.scale.map(n => n.toFixed(3)).join(', ')}</span></div>
+      <h3>${escapeText(t('ui.detail.transformHeading'))}</h3>
+      <div class="field"><label>${escapeText(t('ui.detail.position'))}</label><span class="span">${tx.pos.map(n => n.toFixed(2)).join(', ')}</span></div>
+      <div class="field"><label>${escapeText(t('ui.detail.rotation'))}</label><span class="span">${tx.rot.map(n => n.toFixed(2)).join(', ')}</span></div>
+      <div class="field"><label>${escapeText(t('ui.detail.scale'))}</label><span class="span">${tx.scale.map(n => n.toFixed(3)).join(', ')}</span></div>
     </div>` : '';
 
   // ---- steam panel for player saves ----
   const steamHtml = SMDB.steam.isSteamId64(row.actor_name) ? renderSteamSection(row.actor_name) : '';
 
   // ---- blob panel via codecs ----
-  const blobHtml = blobLen === 0 ? '<div class="muted">no blob</div>' : renderBlobByCodec(decoded, row.actor_serial, blob);
+  const blobHtml = blobLen === 0 ? `<div class="muted">${escapeText(t('ui.detail.noBlob'))}</div>` : renderBlobByCodec(decoded, row.actor_serial, blob);
 
   $('detail').innerHTML = `
     <div class="detail-section">
       <div style="display:flex; justify-content:space-between; align-items:center;">
-        <h3 style="margin:0;">Row #${row.actor_serial} <span class="pill ${summary._kind}">${summary._kind}</span></h3>
-        <button id="closeDetail">close</button>
+        <h3 style="margin:0;">${escapeText(t('ui.detail.rowHeading', { serial: row.actor_serial }))} <span class="pill ${summary._kind}">${escapeText(t('ui.kind.' + summary._kind, {default: summary._kind}))}</span></h3>
+        <button id="closeDetail">${escapeText(t('ui.detail.close'))}</button>
       </div>
       <div class="muted" style="margin-top:6px;">${escapeText(summary._label)}</div>
       <div class="muted">${escapeText(summary._summary)}</div>
@@ -448,27 +462,27 @@ function renderDetail(row, summary) {
     ${steamHtml}
 
     <div class="detail-section">
-      <h3>Numeric (read-only)</h3>
+      <h3>${escapeText(t('ui.detail.numeric'))}</h3>
       <div class="field"><label>actor_serial</label><span class="span">${row.actor_serial}</span></div>
       <div class="field"><label>data_version</label><span class="span">${row.data_version}</span></div>
     </div>
 
     <div class="detail-section">
-      <h3>Editable text fields</h3>
+      <h3>${escapeText(t('ui.detail.editable'))}</h3>
       ${fieldsHtml}
       <div class="toolbar">
-        <button id="saveRow" class="primary" disabled>save changes</button>
-        <button id="revertRow" disabled>revert</button>
-        <button id="stashRow">⎘ stash</button>
+        <button id="saveRow" class="primary" disabled>${escapeText(t('ui.detail.saveChanges'))}</button>
+        <button id="revertRow" disabled>${escapeText(t('ui.detail.revert'))}</button>
+        <button id="stashRow">${escapeText(t('ui.detail.stashRow'))}</button>
         <span class="spacer" style="flex:1;"></span>
-        <button id="deleteRow" class="danger">delete row</button>
+        <button id="deleteRow" class="danger">${escapeText(t('ui.detail.deleteRow'))}</button>
       </div>
     </div>
 
     ${txHtml}
 
     <div class="detail-section">
-      <h3>Blob (${fmtBytes(blobLen)}, codec: ${decoded ? decoded.kind : '—'})</h3>
+      <h3>${escapeText(t('ui.detail.blobHeading', { size: fmtBytes(blobLen), codec: decoded ? decoded.kind : t('ui.detail.blobNone') }))}</h3>
       ${blobHtml}
     </div>`;
 
@@ -479,54 +493,65 @@ function renderSteamSection(steamid64) {
   const s = SMDB.steam.decompose(steamid64);
   if (!s) return '';
   const stored = SMDB.steam.getLabel(steamid64) || '';
+  const info = SMDB.steam.getInfo(steamid64);
+  const placeholder = info && info.personaName
+    ? t('ui.steam.placeholder.auto', { name: info.personaName })
+    : t('ui.steam.placeholder.manual');
+  const avatarHtml = info && info.avatar
+    ? `<div class="field"><label>${escapeText(t('ui.steam.avatar'))}</label><img src="${escapeAttr(info.avatar)}" alt="" referrerpolicy="no-referrer" style="width:48px; height:48px; border:1px solid var(--border); border-radius:2px;"></div>`
+    : '';
   return `
     <div class="detail-section">
-      <h3>Steam Account</h3>
-      <div class="field"><label>persona name</label>
-        <input id="steamLabel" value="${escapeAttr(stored)}" placeholder="(open profile, paste name here)">
+      <h3>${escapeText(t('ui.steam.heading'))}</h3>
+      ${avatarHtml}
+      <div class="field"><label>${escapeText(t('ui.steam.personaName'))}</label>
+        <input id="steamLabel" value="${escapeAttr(stored)}" placeholder="${escapeAttr(placeholder)}">
       </div>
-      <div class="field"><label>SteamID64</label><span class="span">${escapeText(s.steamid64)}</span></div>
-      <div class="field"><label>SteamID3</label><span class="span">${escapeText(s.steamid3)}</span></div>
-      <div class="field"><label>SteamID v1</label><span class="span">${escapeText(s.steamidV1)}</span></div>
-      <div class="field"><label>account ID</label><span class="span">${escapeText(s.accountId)}</span></div>
+      <div class="field"><label>${escapeText(t('ui.steam.steamid64'))}</label><span class="span">${escapeText(s.steamid64)}</span></div>
+      <div class="field"><label>${escapeText(t('ui.steam.steamid3'))}</label><span class="span">${escapeText(s.steamid3)}</span></div>
+      <div class="field"><label>${escapeText(t('ui.steam.steamidV1'))}</label><span class="span">${escapeText(s.steamidV1)}</span></div>
+      <div class="field"><label>${escapeText(t('ui.steam.accountId'))}</label><span class="span">${escapeText(s.accountId)}</span></div>
       <div class="toolbar">
         <a href="${s.profileUrl}" target="_blank" rel="noopener noreferrer">
-          <button type="button">↗ open Steam profile</button>
+          <button type="button">${escapeText(t('ui.steam.openProfile'))}</button>
         </a>
-        <button id="saveSteamLabel" class="primary" disabled>save persona name</button>
+        <button id="saveSteamLabel" class="primary" disabled>${escapeText(t('ui.steam.savePersona'))}</button>
       </div>
     </div>`;
 }
 
 function renderBlobByCodec(decoded, serial, rawBlob) {
-  if (!decoded) return '<div class="muted">no blob</div>';
+  if (!decoded) return `<div class="muted">${escapeText(t('ui.detail.noBlob'))}</div>`;
   if (decoded.kind === 'json-wrapped')      return renderJsonBlob(decoded, serial);
   if (decoded.kind === 'unreal-properties') return renderUnrealProperties(decoded, rawBlob);
   // unknown / empty
   if (decoded._raw) {
+    const header = Array.from(decoded._raw.subarray(0, 8)).map(b => b.toString(16).padStart(2, '0')).join(' ');
     return `
-      <div class="muted">unknown format (header: ${Array.from(decoded._raw.subarray(0, 8)).map(b => b.toString(16).padStart(2, '0')).join(' ')})</div>
-      <details open><summary>Hex (first 4 KB of ${decoded.totalSize.toLocaleString()} B)</summary>
+      <div class="muted">${escapeText(t('ui.blob.unknownFormat', { header }))}</div>
+      <details open><summary>${escapeText(t('ui.blob.hexHead', { size: decoded.totalSize.toLocaleString() }))}</summary>
         <pre class="hex">${escapeText(hexDump(decoded._raw, 0, 4096))}</pre></details>`;
   }
-  return '<div class="muted">empty</div>';
+  return `<div class="muted">${escapeText(t('ui.detail.empty'))}</div>`;
 }
 
 function renderJsonBlob(decoded, serial) {
-  const parseErr = decoded.parseError ? `<div class="danger" style="margin-bottom:6px;">parse error: ${escapeText(decoded.parseError)}</div>` : '';
+  const parseErr = decoded.parseError
+    ? `<div class="danger" style="margin-bottom:6px;">${escapeText(t('ui.blob.parseError', { message: decoded.parseError }))}</div>`
+    : '';
   const pretty = decoded.parsed != null ? JSON.stringify(decoded.parsed, null, 2) : decoded.text;
   return `
     ${parseErr}
     <div class="field" style="grid-template-columns: 110px 1fr; align-items: stretch;">
-      <label>JSON</label>
+      <label>${escapeText(t('ui.blob.json'))}</label>
       <textarea id="jsonEditor" rows="8" data-serial="${serial}">${escapeText(pretty)}</textarea>
     </div>
     <div class="toolbar">
-      <button id="saveJsonBlob" class="primary" disabled>save JSON</button>
-      <button id="revertJsonBlob" disabled>revert</button>
+      <button id="saveJsonBlob" class="primary" disabled>${escapeText(t('ui.blob.saveJson'))}</button>
+      <button id="revertJsonBlob" disabled>${escapeText(t('ui.blob.revertJson'))}</button>
       <span class="muted" id="jsonStatus"></span>
     </div>
-    <details><summary>Header / metadata</summary>
+    <details><summary>${escapeText(t('ui.blob.headerMeta'))}</summary>
       <pre class="hex">${escapeText(JSON.stringify(decoded.header, null, 2))}</pre>
     </details>`;
 }
@@ -541,20 +566,16 @@ function renderUnrealProperties(decoded, rawBlob) {
     `body bytes    ${decoded.bodySize}`,
   ].join('\n');
 
-  const namesText = decoded.names.length === 0 ? '(none)' :
+  const namesText = decoded.names.length === 0 ? t('ui.blob.namesNone') :
     decoded.names.map(n => `@0x${n.offset.toString(16).padStart(6, '0')}  len=${String(n.length).padStart(3)}  ${n.text}`).join('\n');
 
   return `
-    <div class="muted" style="margin-bottom:8px;">
-      The body of this format uses a Soulmask-specific tagged-property layout that hasn't been
-      fully reverse-engineered. This view shows the parsed 14-byte header and the
-      length-prefixed FNames the format embeds literally. Writes are pass-through only.
-    </div>
-    <details open><summary>Header (${SMDB.codecUnrealProperties.HEADER_SIZE} bytes)</summary>
+    <div class="muted" style="margin-bottom:8px;">${escapeText(t('ui.blob.unrealNote'))}</div>
+    <details open><summary>${escapeText(t('ui.blob.unrealHeader', { size: SMDB.codecUnrealProperties.HEADER_SIZE }))}</summary>
       <pre class="hex">${escapeText(headerLines)}</pre></details>
-    <details open><summary>Length-prefixed FNames (${decoded.names.length})</summary>
+    <details open><summary>${escapeText(t('ui.blob.unrealNames', { count: decoded.names.length }))}</summary>
       <pre class="hex">${escapeText(namesText)}</pre></details>
-    <details><summary>Hex dump (first 4 KB of ${decoded.totalSize.toLocaleString()} B)</summary>
+    <details><summary>${escapeText(t('ui.blob.hexFull', { size: decoded.totalSize.toLocaleString() }))}</summary>
       <pre class="hex">${escapeText(hexDump(rawBlob, 0, 4096))}</pre></details>
   `;
 }
@@ -567,7 +588,7 @@ function renderPropertyEntry(prop, idx, depth) {
   const nameStr = formatFName(t.name) + (t.arrayIndex ? `[${t.arrayIndex}]` : '');
   const valueHtml = renderValue(t, prop.value, depth);
   const sizeWarn = prop._sizeMismatch
-    ? ` <span class="danger" title="reader and tag.Size disagree">⚠</span>`
+    ? ` <span class="danger" title="${escapeAttr(t('ui.tree.sizeMismatchTitle'))}">⚠</span>`
     : '';
   const guidLine = t.hasPropertyGuid ? ` <span class="muted">{${t.propertyGuid}}</span>` : '';
   return `
@@ -596,11 +617,11 @@ function formatFName(n) {
 }
 
 function renderValue(tag, value, depth) {
-  const t = tag.type.value;
+  const propType = tag.type.value;  // local var (shadows file-scope `t` i18n alias)
   if (value && value._opaque) {
-    return `<span class="muted">&lt;opaque ${value._opaque.length} B: ${escapeText(value._opaqueReason || '?')}&gt;</span>`;
+    return `<span class="muted">${escapeText(SMDB.i18n.t('ui.tree.opaque', { bytes: value._opaque.length, reason: value._opaqueReason || '?' }))}</span>`;
   }
-  switch (t) {
+  switch (propType) {
     case 'IntProperty': case 'Int8Property': case 'Int16Property':
     case 'UInt16Property': case 'UInt32Property':
       return `= <code>${value}</code>`;
@@ -634,14 +655,14 @@ function renderValue(tag, value, depth) {
     case 'MapProperty':
       return renderMapValue(tag, value, depth);
     case 'TextProperty':
-      return `<span class="muted">&lt;FText, ${value && value._opaque ? value._opaque.length : 0} B&gt;</span>`;
+      return `<span class="muted">${escapeText(SMDB.i18n.t('ui.tree.text', { bytes: value && value._opaque ? value._opaque.length : 0 }))}</span>`;
     default:
-      return `<span class="muted">&lt;${escapeText(t)} value&gt;</span>`;
+      return `<span class="muted">${escapeText(SMDB.i18n.t('ui.tree.value', { type: propType }))}</span>`;
   }
 }
 
 function renderStructValue(sv, depth) {
-  if (!sv) return '<span class="muted">(empty struct)</span>';
+  if (!sv) return `<span class="muted">${escapeText(t('ui.tree.emptyStruct'))}</span>`;
   const name = sv._structName;
   // Known-binary struct: render compactly.
   if (SMDB.codecUnrealProperties.STRUCT_HANDLERS[name]) {
@@ -649,10 +670,10 @@ function renderStructValue(sv, depth) {
   }
   // Unknown struct: nested properties
   if (sv._structDecodeError) {
-    return `<span class="danger">struct decode error: ${escapeText(sv._structDecodeError)}</span>`;
+    return `<span class="danger">${escapeText(t('ui.tree.structDecodeError', { message: sv._structDecodeError }))}</span>`;
   }
   if (!Array.isArray(sv.value) || sv.value.length === 0) {
-    return `<span class="muted">(empty)</span>`;
+    return `<span class="muted">${escapeText(t('ui.tree.empty'))}</span>`;
   }
   const inner = sv.value.map((p, i) => renderPropertyEntry(p, i, depth + 1)).join('');
   return `<div class="prop-children">${inner}</div>`;
@@ -680,7 +701,7 @@ function renderArrayValue(tag, value, depth) {
       <span class="prop-name">[${i}]</span>
       <span class="prop-val">= <code>${escapeText(stringifyForInline(e))}</code></span></div>`;
   }).join('');
-  return `<span class="muted">[${value.elements.length} items]</span><div class="prop-children">${items}</div>`;
+  return `<span class="muted">${escapeText(t('ui.tree.items', { count: value.elements.length }))}</span><div class="prop-children">${items}</div>`;
 }
 
 function renderSetValue(tag, value, depth) {
@@ -688,7 +709,7 @@ function renderSetValue(tag, value, depth) {
     `<div class="prop-row" style="padding-left:${(depth+1)*14}px;">
       <span class="prop-name">{${i}}</span>
       <span class="prop-val">= <code>${escapeText(stringifyForInline(e))}</code></span></div>`).join('');
-  return `<span class="muted">{${(value.elements||[]).length} items}</span><div class="prop-children">${items}</div>`;
+  return `<span class="muted">${escapeText(t('ui.tree.setItems', { count: (value.elements||[]).length }))}</span><div class="prop-children">${items}</div>`;
 }
 
 function renderMapValue(tag, value, depth) {
@@ -696,7 +717,7 @@ function renderMapValue(tag, value, depth) {
     `<div class="prop-row" style="padding-left:${(depth+1)*14}px;">
       <span class="prop-name"><code>${escapeText(stringifyForInline(e.key))}</code></span>
       <span class="prop-val"> → <code>${escapeText(stringifyForInline(e.value))}</code></span></div>`).join('');
-  return `<span class="muted">{${(value.entries||[]).length} entries}</span><div class="prop-children">${items}</div>`;
+  return `<span class="muted">${escapeText(t('ui.tree.entries', { count: (value.entries||[]).length }))}</span><div class="prop-children">${items}</div>`;
 }
 
 function stringifyForInline(v) {
@@ -743,7 +764,7 @@ function wireDetailEditing(row, summary, decoded) {
         const trimmed = inp.value.trim();
         const num = Number(trimmed);
         if (trimmed === '' || !Number.isFinite(num) || !Number.isInteger(num)) {
-          alert(`${f} must be an integer (got ${JSON.stringify(inp.value)})`);
+          alert(t('ui.alert.integerRequired', { field: f, value: JSON.stringify(inp.value) }));
           return;
         }
         updates[f] = num;
@@ -758,15 +779,15 @@ function wireDetailEditing(row, summary, decoded) {
         sql: `UPDATE actor_table SET ${cols.map(c => `${c} = ?`).join(', ')} WHERE actor_serial = ?`,
         bind: [...cols.map(c => updates[c]), row.actor_serial],
       });
-    } catch (e) { alert(`update failed: ${e.message}`); return; }
+    } catch (e) { alert(t('ui.alert.updateFailed', { message: e.message })); return; }
     markDirty(); loadRows(); applyFilters(); selectRow(row.actor_serial);
   });
 
   // delete --------
   $('deleteRow').addEventListener('click', () => {
-    if (!confirm(`Delete actor_serial=${row.actor_serial}? This will be lost on download. Cancel and Download first if you want a backup.`)) return;
+    if (!confirm(t('ui.alert.confirmDeleteRow', { serial: row.actor_serial }))) return;
     try { db.exec({ sql: 'DELETE FROM actor_table WHERE actor_serial = ?', bind: [row.actor_serial] }); }
-    catch (e) { alert(`delete failed: ${e.message}`); return; }
+    catch (e) { alert(t('ui.alert.deleteFailed', { message: e.message })); return; }
     markDirty();
     selectedSerial = null;
     $('detail').classList.add('hidden');
@@ -776,15 +797,16 @@ function wireDetailEditing(row, summary, decoded) {
 
   // stash --------
   $('stashRow').addEventListener('click', () => {
+    const personaName = SMDB.steam.displayName(row.actor_name);
     const defaultLabel = SMDB.steam.isSteamId64(row.actor_name)
-      ? `Player ${row.actor_name}${SMDB.steam.getLabel(row.actor_name) ? ' (' + SMDB.steam.getLabel(row.actor_name) + ')' : ''}`
-      : `#${row.actor_serial} ${summary._label}`;
-    const label = prompt(`Label for this stashed row:`, defaultLabel);
+      ? t('ui.stash.defaultPlayerLabel', { id: row.actor_name, suffix: personaName ? ' (' + personaName + ')' : '' })
+      : t('ui.stash.defaultRowLabel', { serial: row.actor_serial, label: summary._label });
+    const label = prompt(t('ui.stash.promptLabel'), defaultLabel);
     if (label === null) return;
     const entry = SMDB.stash.rowToStashEntry(row, { sourceFile: currentFileLabel, label });
     SMDB.stash.add(entry);
     updateChrome();
-    setStatus(`stashed row #${row.actor_serial} as "${entry.label}"`);
+    setStatus(t('ui.status.stashed', { serial: row.actor_serial, label: entry.label }));
   });
 
   $('closeDetail').addEventListener('click', () => {
@@ -802,7 +824,7 @@ function wireDetailEditing(row, summary, decoded) {
     });
     $('saveSteamLabel').addEventListener('click', () => {
       SMDB.steam.setLabel(row.actor_name, $('steamLabel').value);
-      setStatus(`saved persona name for ${row.actor_name}`);
+      setStatus(t('ui.status.savedPersona', { id: row.actor_name }));
       // refresh table to show new label
       loadRows(); applyFilters();
       selectRow(row.actor_serial);
@@ -817,8 +839,8 @@ function wireDetailEditing(row, summary, decoded) {
       $('saveJsonBlob').disabled = !changed;
       $('revertJsonBlob').disabled = !changed;
       // live parse check
-      try { JSON.parse($('jsonEditor').value); $('jsonStatus').textContent = changed ? 'JSON OK' : ''; }
-      catch (e) { $('jsonStatus').textContent = 'parse error: ' + e.message; }
+      try { JSON.parse($('jsonEditor').value); $('jsonStatus').textContent = changed ? t('ui.blob.jsonOk') : ''; }
+      catch (e) { $('jsonStatus').textContent = t('ui.blob.jsonParseError', { message: e.message }); }
     };
     $('jsonEditor').addEventListener('input', updateJsonChanged);
     $('revertJsonBlob').addEventListener('click', () => {
@@ -828,12 +850,12 @@ function wireDetailEditing(row, summary, decoded) {
     $('saveJsonBlob').addEventListener('click', () => {
       let parsed;
       try { parsed = JSON.parse($('jsonEditor').value); }
-      catch (e) { alert(`won't save: invalid JSON (${e.message})`); return; }
+      catch (e) { alert(t('ui.alert.jsonInvalid', { message: e.message })); return; }
       const newDecoded = { ...decoded, parsed, text: JSON.stringify(parsed) };
       const newBytes = SMDB.codecs.encode(newDecoded);
       try {
         db.exec({ sql: 'UPDATE actor_table SET actor_data = ? WHERE actor_serial = ?', bind: [newBytes, row.actor_serial] });
-      } catch (e) { alert(`update failed: ${e.message}`); return; }
+      } catch (e) { alert(t('ui.alert.updateFailed', { message: e.message })); return; }
       markDirty(); loadRows(); applyFilters(); selectRow(row.actor_serial);
     });
   }
@@ -852,32 +874,36 @@ function renderStashList() {
   const entries = SMDB.stash.list();
   const body = $('stashList');
   if (entries.length === 0) {
-    body.innerHTML = `<div class="muted" style="padding:20px; text-align:center;">No rows stashed yet. Open a row, click "stash".</div>`;
+    body.innerHTML = `<div class="muted" style="padding:20px; text-align:center;">${escapeText(t('ui.stash.empty'))}</div>`;
     return;
   }
   body.innerHTML = entries.map(e => {
     const r = e.row;
-    const blobInfo = r.actor_data_b64 ? fmtBytes(Math.floor(r.actor_data_b64.length * 0.75)) : 'no blob';
+    const blobInfo = r.actor_data_b64 ? fmtBytes(Math.floor(r.actor_data_b64.length * 0.75)) : t('ui.stash.noBlob');
     const isPlayer = SMDB.steam.isSteamId64(r.actor_name);
-    const personaSuffix = isPlayer && SMDB.steam.getLabel(r.actor_name)
-      ? ` (${SMDB.steam.getLabel(r.actor_name)})` : '';
+    const personaShown = isPlayer ? SMDB.steam.displayName(r.actor_name) : null;
+    const personaSuffix = personaShown ? ` (${personaShown})` : '';
+    const metaLine = t('ui.stash.metaLine', {
+      source:  e.sourceFile || t('ui.stash.sourceUnknown'),
+      savedAt: e.savedAt.replace('T', ' ').slice(0, 19),
+      blob:    blobInfo,
+      serial:  r._origSerial ?? '?',
+    });
     return `
       <div class="stash-entry" data-id="${e.id}">
         <div class="stash-header">
           <div>
             <div class="stash-label">${escapeText(e.label)}${escapeText(personaSuffix)}</div>
             <div class="muted" style="font-size:11px;">
-              ${escapeText(r.actor_script || '(no script)')}
+              ${escapeText(r.actor_script || t('ui.stash.noScript'))}
             </div>
-            <div class="muted" style="font-size:11px;">
-              from ${escapeText(e.sourceFile || 'unknown')} · ${escapeText(e.savedAt.replace('T', ' ').slice(0, 19))} · ${blobInfo} · orig serial #${r._origSerial ?? '?'}
-            </div>
-            ${e.note ? `<div class="muted" style="font-size:11px; margin-top:2px;">note: ${escapeText(e.note)}</div>` : ''}
+            <div class="muted" style="font-size:11px;">${escapeText(metaLine)}</div>
+            ${e.note ? `<div class="muted" style="font-size:11px; margin-top:2px;">${escapeText(t('ui.stash.noteLine', { note: e.note }))}</div>` : ''}
           </div>
           <div class="row-actions">
-            <button class="stash-paste" ${db ? '' : 'disabled title="load a world.db first"'}>paste here</button>
-            <button class="stash-edit">edit</button>
-            <button class="stash-del danger">delete</button>
+            <button class="stash-paste" ${db ? '' : `disabled title="${escapeAttr(t('ui.stash.pasteDisabled'))}"`}>${escapeText(t('ui.stash.paste'))}</button>
+            <button class="stash-edit">${escapeText(t('ui.stash.edit'))}</button>
+            <button class="stash-del danger">${escapeText(t('ui.stash.delete'))}</button>
           </div>
         </div>
       </div>`;
@@ -887,7 +913,7 @@ function renderStashList() {
     const id = el.dataset.id;
     el.querySelector('.stash-paste').addEventListener('click', () => pasteFromStash(id));
     el.querySelector('.stash-del').addEventListener('click', () => {
-      if (confirm('Remove this stashed row?')) { SMDB.stash.remove(id); renderStashList(); updateChrome(); }
+      if (confirm(t('ui.stash.confirmRemoveOne'))) { SMDB.stash.remove(id); renderStashList(); updateChrome(); }
     });
     el.querySelector('.stash-edit').addEventListener('click', () => editStashEntry(id));
   });
@@ -896,16 +922,16 @@ function renderStashList() {
 function editStashEntry(id) {
   const entry = SMDB.stash.get(id);
   if (!entry) return;
-  const newLabel = prompt('Label:', entry.label);
+  const newLabel = prompt(t('ui.stash.editLabel'), entry.label);
   if (newLabel === null) return;
-  const newNote = prompt('Note (optional):', entry.note || '');
+  const newNote = prompt(t('ui.stash.editNote'), entry.note || '');
   if (newNote === null) return;
   SMDB.stash.update(id, { label: newLabel, note: newNote });
   renderStashList();
 }
 
 function pasteFromStash(id) {
-  if (!db) { alert('Load a world.db first.'); return; }
+  if (!db) { alert(t('ui.alert.loadDbFirst')); return; }
   const entry = SMDB.stash.get(id);
   if (!entry) return;
   const bindings = SMDB.stash.stashEntryToBindings(entry);
@@ -917,11 +943,7 @@ function pasteFromStash(id) {
   }
 
   if (existingSerial) {
-    const ok = confirm(
-      `A row with actor_name='${bindings.actor_name}' already exists in this DB ` +
-      `(actor_serial=${existingSerial}).\n\n` +
-      `Click OK to REPLACE that row's contents with the stashed data.\n` +
-      `Click Cancel to abort the paste.`);
+    const ok = confirm(t('ui.alert.confirmReplaceRow', { name: bindings.actor_name, serial: existingSerial }));
     if (!ok) return;
     const cols = SMDB.stash.ROW_COLUMNS.concat(['actor_data']);
     try {
@@ -929,9 +951,9 @@ function pasteFromStash(id) {
         sql: `UPDATE actor_table SET ${cols.map(c => `${c} = ?`).join(', ')} WHERE actor_serial = ?`,
         bind: [...cols.map(c => bindings[c]), existingSerial],
       });
-    } catch (e) { alert(`replace failed: ${e.message}`); return; }
+    } catch (e) { alert(t('ui.alert.replaceFailed', { message: e.message })); return; }
     markDirty(); loadRows(); applyFilters();
-    setStatus(`replaced row #${existingSerial} from stash "${entry.label}"`);
+    setStatus(t('ui.status.replacedFromStash', { serial: existingSerial, label: entry.label }));
     selectRow(existingSerial);
   } else {
     const cols = SMDB.stash.ROW_COLUMNS.concat(['actor_data']);
@@ -940,10 +962,10 @@ function pasteFromStash(id) {
         sql: `INSERT INTO actor_table (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
         bind: cols.map(c => bindings[c]),
       });
-    } catch (e) { alert(`insert failed: ${e.message}`); return; }
+    } catch (e) { alert(t('ui.alert.insertFailed', { message: e.message })); return; }
     const newSerial = db.selectValue('SELECT last_insert_rowid()');
     markDirty(); loadRows(); applyFilters();
-    setStatus(`pasted stash "${entry.label}" as new row #${newSerial}`);
+    setStatus(t('ui.status.pastedAsNew', { label: entry.label, serial: newSerial }));
     selectRow(newSerial);
   }
   $('stashDialog').close();
@@ -964,9 +986,9 @@ function importStashFile(file) {
   reader.onload = () => {
     try {
       const result = SMDB.stash.importFromJson(reader.result, { mode: 'merge' });
-      setStatus(`imported ${result.imported} entries (stash now has ${result.total})`);
+      setStatus(t('ui.status.imported', { count: result.imported, total: result.total }));
       renderStashList(); updateChrome();
-    } catch (e) { alert(`import failed: ${e.message}`); }
+    } catch (e) { alert(t('ui.alert.importFailed', { message: e.message })); }
   };
   reader.readAsText(file);
 }
@@ -986,7 +1008,7 @@ function importStashFile(file) {
 async function runVerifyAll() {
   if (!db) return;
   $('verifyDialog').showModal();
-  $('verifySummary').textContent = 'Loading blobs…';
+  $('verifySummary').textContent = t('ui.verify.loadingBlobs');
   $('verifyFailures').innerHTML = '';
 
   const rows = [];
@@ -1013,27 +1035,37 @@ async function runVerifyAll() {
       failures.push({ serial: r.actor_serial, script: r.actor_script, reason: res.reason });
     }
     if (i % BATCH === 0) {
-      $('verifySummary').innerHTML = `Tested ${i.toLocaleString()} / ${rows.length.toLocaleString()}  —  <span style="color:var(--ok);">${ok} OK</span>, <span class="danger">${fail} fail</span>, ${skipped} skipped`;
+      $('verifySummary').innerHTML = t('ui.verify.progress', {
+        done:    i.toLocaleString(),
+        total:   rows.length.toLocaleString(),
+        ok:      `<span style="color:var(--ok);">${ok}</span>`,
+        fail:    `<span class="danger">${fail}</span>`,
+        skipped,
+      });
       await new Promise(r => setTimeout(r, 0));
     }
   }
 
   const passRate = rows.length > 0 ? ((ok / (ok + fail || 1)) * 100).toFixed(2) : '0';
+  const summaryHtml = t('ui.verify.doneSummary', {
+    ok:      `<span style="color:var(--ok);">✓ ${ok.toLocaleString()}</span>`,
+    fail:    `<span class="danger">✗ ${fail.toLocaleString()}</span>`,
+    skipped: skipped.toLocaleString(),
+    pass:    passRate,
+  });
   $('verifySummary').innerHTML = `
-    <div style="margin-bottom:6px;"><strong>Done.</strong> ${rows.length.toLocaleString()} blobs tested.</div>
-    <div><span style="color:var(--ok);">✓ ${ok.toLocaleString()} round-trip OK</span>
-         &nbsp;·&nbsp; <span class="danger">✗ ${fail.toLocaleString()} fail</span>
-         &nbsp;·&nbsp; ${skipped.toLocaleString()} skipped (non-unreal-properties)
-         &nbsp;·&nbsp; ${passRate}% pass</div>`;
+    <div style="margin-bottom:6px;"><strong>${escapeText(t('ui.verify.doneHeading', { total: rows.length.toLocaleString() }))}</strong></div>
+    <div>${summaryHtml}</div>`;
 
   // Show first 200 failures grouped by root-cause-ish prefix.
   const shown = failures.slice(0, 200);
+  const moreCount = failures.length - shown.length;
   $('verifyFailures').innerHTML = shown.map(f => `
     <div class="verify-fail">
       <span class="ser">#${f.serial}</span>
       <span class="muted">${escapeText((f.script || '').replace(/.*[./]/, '').replace(/_C$/, ''))}</span>
       <div class="reason">${escapeText(f.reason)}</div>
-    </div>`).join('') + (failures.length > shown.length ? `<div class="muted" style="padding:8px 14px;">… ${failures.length - shown.length} more failures not shown</div>` : '');
+    </div>`).join('') + (moreCount > 0 ? `<div class="muted" style="padding:8px 14px;">${escapeText(t('ui.verify.moreFailures', { count: moreCount }))}</div>` : '');
 }
 
 // ============================================================
@@ -1042,7 +1074,7 @@ async function runVerifyAll() {
 
 function downloadDB() {
   if (!db) return;
-  setStatus('serializing…');
+  setStatus(t('ui.status.serializing'));
   const out = sqlite3.capi.sqlite3_js_db_export(db.pointer);
   const blob = new Blob([out], { type: 'application/x-sqlite3' });
   const url = URL.createObjectURL(blob);
@@ -1055,7 +1087,7 @@ function downloadDB() {
   URL.revokeObjectURL(url);
   dirty = false;
   updateChrome();
-  setStatus(`exported ${fmtBytes(out.byteLength)}`);
+  setStatus(t('ui.status.exported', { size: fmtBytes(out.byteLength) }));
 }
 
 // ============================================================
@@ -1074,6 +1106,16 @@ $('downloadBtn').addEventListener('click', downloadDB);
 $('verifyAllBtn').addEventListener('click', runVerifyAll);
 $('verifyClose').addEventListener('click', () => $('verifyDialog').close());
 
+$('steamCacheBtn').addEventListener('click', () => {
+  const n = SMDB.steam.cacheCount();
+  if (n === 0) return;
+  if (confirm(t('ui.alert.confirmClearSteam', { count: n }))) {
+    SMDB.steam.clearCache();
+    updateChrome();
+    if (db) renderTable();
+  }
+});
+
 $('stashBtn').addEventListener('click', openStash);
 $('stashClose').addEventListener('click', () => $('stashDialog').close());
 $('stashExport').addEventListener('click', exportStashFile);
@@ -1083,8 +1125,9 @@ $('stashImportInput').addEventListener('change', e => {
   e.target.value = '';
 });
 $('stashClear').addEventListener('click', () => {
-  if (SMDB.stash.count() === 0) return;
-  if (confirm(`Delete all ${SMDB.stash.count()} stashed rows? This can't be undone (export first if you want a backup).`)) {
+  const n = SMDB.stash.count();
+  if (n === 0) return;
+  if (confirm(t('ui.stash.confirmClear', { count: n }))) {
     SMDB.stash.clear(); renderStashList(); updateChrome();
   }
 });
@@ -1093,5 +1136,23 @@ window.addEventListener('beforeunload', e => {
   if (dirty) { e.preventDefault(); e.returnValue = ''; }
 });
 
-bootSqlite().catch(e => setStatus('sqlite init failed: ' + e.message));
+// ---- i18n boot ---------------------------------------------------------
+// Apply translations to the static DOM, then populate the language switcher.
+SMDB.i18n.applyToDom();
+(() => {
+  const sel = $('langSelect');
+  const cur = SMDB.i18n.currentLocale;
+  for (const code of SMDB.i18n.availableLocales()) {
+    const name = (window.SMDB_LOCALES[code] && window.SMDB_LOCALES[code]._displayName) || code;
+    const opt = document.createElement('option');
+    opt.value = code;
+    opt.textContent = name;
+    if (code === cur) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  sel.addEventListener('change', () => SMDB.i18n.setLocale(sel.value));
+  document.documentElement.lang = cur;
+})();
+
+bootSqlite().catch(e => setStatus(t('ui.status.sqliteInitFailed', { message: e.message })));
 updateChrome();
