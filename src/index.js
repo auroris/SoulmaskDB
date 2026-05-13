@@ -1,5 +1,5 @@
 /**
- * Steam64 → persona-name resolver.
+ * Steam64 → persona-name resolver (Cloudflare Worker entry point).
  *
  * GET  /api/steam/names?ids=A,B,C
  * POST /api/steam/names   body: {"ids": ["A","B","C"]}
@@ -11,8 +11,8 @@
  *   [ {steamid64, personaName, avatar, profileUrl} | null, ... ]
  *
  * Wiring:
- *   - STEAM_API_KEY        Pages env var / `.dev.vars`
- *   - ALLOWED_ORIGIN       Pages env var / `.dev.vars` (CORS origin allowed)
+ *   - STEAM_API_KEY        env var / `.dev.vars`
+ *   - ALLOWED_ORIGIN       env var / `.dev.vars` (CORS origin allowed)
  *
  * Caching: edge cache for 24h. Clients should sort IDs before requesting
  * to maximize cache hits across users.
@@ -22,27 +22,40 @@ const STEAM_API_URL = 'https://api.steampowered.com/ISteamUser/GetPlayerSummarie
 const STEAM_BATCH_SIZE = 100;
 const MAX_IDS_PER_REQUEST = 500;
 const STEAM_ID_RE = /^7656119\d{10}$/;
+const NAMES_PATH = '/api/steam/names';
 
-export async function onRequestGet({ request, env }) {
-  const url = new URL(request.url);
-  const idsParam = url.searchParams.get('ids') || '';
-  const ids = idsParam.split(',').map(s => s.trim()).filter(Boolean);
-  return handle(ids, env);
-}
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname !== NAMES_PATH) {
+      return new Response('Not found', { status: 404 });
+    }
 
-export async function onRequestPost({ request, env }) {
-  let body;
-  try { body = await request.json(); }
-  catch { return errorResponse(400, 'invalid json body', env); }
-  if (!body || !Array.isArray(body.ids)) {
-    return errorResponse(400, 'expected {"ids":[...]}', env);
-  }
-  return handle(body.ids.map(String), env);
-}
+    switch (request.method) {
+      case 'OPTIONS':
+        return new Response(null, { status: 204, headers: corsHeaders(env) });
 
-export function onRequestOptions({ env }) {
-  return new Response(null, { status: 204, headers: corsHeaders(env) });
-}
+      case 'GET': {
+        const idsParam = url.searchParams.get('ids') || '';
+        const ids = idsParam.split(',').map(s => s.trim()).filter(Boolean);
+        return handle(ids, env);
+      }
+
+      case 'POST': {
+        let body;
+        try { body = await request.json(); }
+        catch { return errorResponse(400, 'invalid json body', env); }
+        if (!body || !Array.isArray(body.ids)) {
+          return errorResponse(400, 'expected {"ids":[...]}', env);
+        }
+        return handle(body.ids.map(String), env);
+      }
+
+      default:
+        return errorResponse(405, 'method not allowed', env);
+    }
+  },
+};
 
 async function handle(ids, env) {
   if (ids.length === 0) return jsonResponse([], env);

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --check functions/api/steam/names.js)",
+      "Bash(node --input-type=module --check)",
+      "Bash(npx wrangler *)"
+    ]
+  }
+}
