@@ -3,7 +3,11 @@
     "allow": [
       "Bash(node --check functions/api/steam/names.js)",
       "Bash(node --input-type=module --check)",
-      "Bash(npx wrangler *)"
+      "Bash(npx wrangler *)",
+      "Bash(node --check \"C:/Users/steph/source/repos/SoulmaskDB/js/app.js\")",
+      "Bash(node --check \"C:/Users/steph/source/repos/SoulmaskDB/js/classify.js\")",
+      "Bash(node --check \"C:/Users/steph/source/repos/SoulmaskDB/js/locale/en.js\")",
+      "Bash(node --check \"C:/Users/steph/source/repos/SoulmaskDB/js/locale/zh.js\")"
     ]
   }
 }

@@ -59,6 +59,29 @@ window.SMDB_LOCALES.zh = {
   'ui.detail.position':             '位置',
   'ui.detail.rotation':             '旋转',
   'ui.detail.scale':                '缩放',
+  'ui.detail.facing':               '朝向',
+  'ui.detail.anchorRow':            '⚓ 锚定用于空间查询',
+  'ui.detail.anchorRowActive':      '⚓ 已锚定',
+
+  // ------------------------------------------------------------------ table
+  'ui.tableHeader.distance':        '距离',
+
+  // ----------------------------------------------------------- spatial anchor
+  'ui.anchor.label':                '⚓ 靠近 #{serial} {label}',
+  'ui.anchor.customLabel':          '⚓ 自定义锚点',
+  'ui.anchor.atButton':             '📍 在坐标处锚定…',
+  'ui.anchor.atButton.title':       '在指定坐标处设置空间锚点',
+  'ui.anchor.range':                '范围:',
+  'ui.anchor.clear':                '清除锚定',
+  'ui.alert.anchorNoTransform':     '无法锚定:此行没有可解析的变换',
+  'ui.compass.N':                   '北',
+  'ui.compass.NE':                  '东北',
+  'ui.compass.E':                   '东',
+  'ui.compass.SE':                  '东南',
+  'ui.compass.S':                   '南',
+  'ui.compass.SW':                  '西南',
+  'ui.compass.W':                   '西',
+  'ui.compass.NW':                  '西北',
 
   // ---------------------------------------------------------- steam section
   'ui.steam.heading':               'Steam 账号',

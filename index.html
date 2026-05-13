@@ -52,6 +52,13 @@
   #controls { padding: 6px 12px; display: flex; gap: 8px; align-items: center;
     border-bottom: 1px solid var(--border); background: var(--panel); }
   #controls #search { flex: 1; }
+  #anchorChip { display: inline-flex; gap: 6px; align-items: center;
+    padding: 2px 8px; border: 1px solid var(--border); border-radius: 12px;
+    background: var(--panel2); font-size: 12px; }
+  #anchorChip.hidden { display: none; }
+  #anchorChip label { color: var(--muted); }
+  #anchorChip input[type="number"] { padding: 1px 4px; }
+  #anchorChip button { padding: 0 6px; }
   main { flex: 1; display: grid; grid-template-columns: 1fr; overflow: hidden; }
   main.with-detail { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
   #tableWrap { overflow: auto; }
@@ -194,6 +201,8 @@
     <option value="other"      data-i18n="ui.kindFilter.other">other</option>
   </select>
   <span id="filterCount" class="muted"></span>
+  <button id="anchorAtBtn" data-i18n="ui.anchor.atButton" data-i18n-title="ui.anchor.atButton.title">📍 anchor at…</button>
+  <span id="anchorChip" class="hidden"></span>
 </section>
 
 <main id="main">

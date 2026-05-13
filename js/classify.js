@@ -99,6 +99,32 @@ SMDB.classify = (() => {
     return { pos: triples[0], rot: triples[1], scale: triples[2] };
   }
 
+  // Yaw (rotation around Z-up axis) → 8-way compass code: 'N','NE','E',…
+  // Unreal serializes FRotator as (pitch, yaw, roll), so yaw is rot[1].
+  // World-axis-to-compass: +X=East, +Y=North. Positive yaw rotates from +X
+  // toward +Y (CCW on map). If verification against a known actor shows the
+  // game's world axes are oriented differently, flip COMPASS or the sign of
+  // yaw here — it's the only place that bakes in the convention.
+  const COMPASS_8 = ['E', 'NE', 'N', 'NW', 'W', 'SW', 'S', 'SE'];
+  function bearingFromTransform(tx) {
+    if (!tx || !Array.isArray(tx.rot) || tx.rot.length !== 3) return null;
+    let yaw = tx.rot[1];
+    if (!isFinite(yaw)) return null;
+    yaw = ((yaw % 360) + 360) % 360;
+    return COMPASS_8[Math.round(yaw / 45) % 8];
+  }
+
+  // 3D Euclidean distance between a parsed transform and an [x,y,z] anchor,
+  // converted from Unreal units (cm) to meters. null on malformed input.
+  function distanceMeters(tx, anchorPos) {
+    if (!tx || !Array.isArray(tx.pos) || tx.pos.length !== 3) return null;
+    if (!Array.isArray(anchorPos) || anchorPos.length !== 3) return null;
+    const dx = tx.pos[0] - anchorPos[0];
+    const dy = tx.pos[1] - anchorPos[1];
+    const dz = tx.pos[2] - anchorPos[2];
+    return Math.hypot(dx, dy, dz) / 100;
+  }
+
   // Romanized-Mandarin blueprint identifier → friendly per-locale words.
   // Gloss table lives in js/locale/{en,zh}.js under 'gloss.*'; missing
   // tokens fall back to the raw token (right default for new
@@ -184,7 +210,9 @@ SMDB.classify = (() => {
     const cls = shortClassName(script);
     const tx = parseTransform(transf);
     const pos = tx ? ` @ ${tx.pos.map(n => Math.round(n)).join(',')}` : '';
-    return { kind, label: cls, summary: translateIdent(cls) + pos };
+    const bearing = tx ? bearingFromTransform(tx) : null;
+    const facing = bearing ? ' ' + SMDB.i18n.t('ui.compass.' + bearing, { default: bearing }) : '';
+    return { kind, label: cls, summary: translateIdent(cls) + pos + facing };
   }
 
   // Group an array of classified rows by actor_script. For each distinct
@@ -219,6 +247,7 @@ SMDB.classify = (() => {
     classify,
     isPlayerRow, isSystemRow,
     shortClassName, parseTransform, translateIdent,
+    bearingFromTransform, distanceMeters,
     aggregateScripts,
     SCRIPT, NAME, RULES,
   };

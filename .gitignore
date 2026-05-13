@@ -10,3 +10,4 @@ package-lock.json
 !.dev.vars.example
 .env*
 !.env.example
+/.claude

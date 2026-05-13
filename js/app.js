@@ -72,6 +72,11 @@ let currentFileLabel = null;
 // inserted rows belong to this server, not whichever server the stash was
 // captured from. See detectServerId() for the lookup strategy.
 let currentServerId = null;
+// Spatial anchor — when set, applyFilters keeps only rows whose transform
+// is within rangeMeters of pos and sorts ascending by distance. Rows
+// without a parseable transform drop out while anchored. Cleared on DB
+// (re)load because positions are world-specific.
+let spatialAnchor = null;  // { serial, label, pos, rangeMeters }
 
 const setStatus = msg => { $('status').textContent = msg || ''; };
 
@@ -112,6 +117,8 @@ function loadBytes(bytes, label) {
   currentServerId = detectServerId();
   dirty = false;
   selectedSerial = null;
+  spatialAnchor = null;
+  renderAnchorChip();
   $('detail').classList.add('hidden');
   $('main').classList.remove('with-detail');
   updateChrome();
@@ -246,8 +253,35 @@ function applyFilters() {
         || (r._summary     || '').toLowerCase().includes(q)
         || (r._blobText    || '').includes(q);  // _blobText is pre-lowercased
   });
+  applySpatialAnchor();
   currentPage = 0;
   renderTable();
+}
+
+// When an anchor is set, mutate `filtered` to keep only rows with a
+// parseable transform within rangeMeters of the anchor, sorted ascending
+// by distance. Stamps `_spatialDist` (meters) on surviving rows so the
+// table render can show a distance column without recomputing. Clears
+// stale `_spatialDist` from any row that survived the previous anchor
+// but no longer applies.
+function applySpatialAnchor() {
+  if (!spatialAnchor) {
+    for (const r of allRows) r._spatialDist = undefined;
+    return;
+  }
+  const range = spatialAnchor.rangeMeters;
+  const withinRange = [];
+  for (const r of allRows) r._spatialDist = undefined;
+  for (const r of filtered) {
+    const tx = SMDB.classify.parseTransform(r.actor_transf);
+    if (!tx) continue;
+    const d = SMDB.classify.distanceMeters(tx, spatialAnchor.pos);
+    if (d == null || d > range) continue;
+    r._spatialDist = d;
+    withinRange.push(r);
+  }
+  withinRange.sort((a, b) => a._spatialDist - b._spatialDist);
+  filtered = withinRange;
 }
 
 function renderTable() {
@@ -256,9 +290,13 @@ function renderTable() {
   const thead = $('rowsTable').querySelector('thead');
   const tbody = $('rowsTable').querySelector('tbody');
 
+  const anchored = !!spatialAnchor;
+  const distHeader = anchored ? `<th>${escapeText(t('ui.tableHeader.distance'))}</th>` : '';
+
   thead.innerHTML = `
     <tr>
       <th>${escapeText(t('ui.tableHeader.serial'))}</th>
+      ${distHeader}
       <th>${escapeText(t('ui.tableHeader.kind'))}</th>
       <th>${escapeText(t('ui.tableHeader.class'))}</th>
       <th>${escapeText(t('ui.tableHeader.summary'))}</th>
@@ -268,16 +306,20 @@ function renderTable() {
     </tr>`;
 
   if (slice.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="7" class="muted" style="padding: 16px;">${escapeText(t('ui.tableEmpty'))}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="${anchored ? 8 : 7}" class="muted" style="padding: 16px;">${escapeText(t('ui.tableEmpty'))}</td></tr>`;
   } else {
     tbody.innerHTML = slice.map(r => {
       const nameLabel = SMDB.steam.isSteamId64(r.actor_name) ? steamShortLabel(r.actor_name) : '';
       const labelHtml = nameLabel
         ? `${escapeText(r._label)} <span class="muted">— ${escapeText(nameLabel)}</span>`
         : escapeText(r._label);
+      const distCell = anchored
+        ? `<td class="muted">${r._spatialDist != null ? r._spatialDist.toFixed(1) + ' m' : ''}</td>`
+        : '';
       return `
       <tr data-serial="${r.actor_serial}" class="${r.actor_serial === selectedSerial ? 'selected' : ''}">
         <td>${r.actor_serial}</td>
+        ${distCell}
         <td><span class="pill ${r._kind}">${escapeText(t('ui.kind.' + r._kind, {default: r._kind}))}</span></td>
         <td title="${escapeAttr(r.actor_script || '')}">${labelHtml}</td>
         <td title="${escapeAttr(r._summary || '')}">${escapeText(r._summary)}</td>
@@ -335,6 +377,91 @@ function steamShortLabel(steamid64) {
   return SMDB.steam.displayName(steamid64) || '';
 }
 
+// Toggle the anchor chip in #controls. When `spatialAnchor` is non-null,
+// shows a label + editable x/y/z position inputs + range (meters) + clear.
+// Editing position decouples the anchor from its source row (clears
+// .serial) so the row's "⚓ anchored" indicator reverts. Position/range
+// edits debounce into applyFilters.
+function renderAnchorChip() {
+  const chip = $('anchorChip');
+  if (!chip) return;
+  if (!spatialAnchor) {
+    chip.classList.add('hidden');
+    chip.innerHTML = '';
+    return;
+  }
+  chip.classList.remove('hidden');
+  const labelText = spatialAnchor.serial != null
+    ? t('ui.anchor.label', { serial: spatialAnchor.serial, label: spatialAnchor.label })
+    : t('ui.anchor.customLabel');
+  chip.innerHTML = `
+    <span class="anchor-label">${escapeText(labelText)}</span>
+    <label>x <input id="anchorPosX" type="number" step="any" value="${spatialAnchor.pos[0]}" style="width:80px;"></label>
+    <label>y <input id="anchorPosY" type="number" step="any" value="${spatialAnchor.pos[1]}" style="width:80px;"></label>
+    <label>z <input id="anchorPosZ" type="number" step="any" value="${spatialAnchor.pos[2]}" style="width:80px;"></label>
+    <label>${escapeText(t('ui.anchor.range'))}
+      <input id="anchorRange" type="number" min="0" step="10" value="${spatialAnchor.rangeMeters}" style="width:70px;"> m
+    </label>
+    <button id="anchorClear" title="${escapeAttr(t('ui.anchor.clear'))}">×</button>
+  `;
+  const onPosInput = debounce(() => {
+    const x = Number($('anchorPosX').value);
+    const y = Number($('anchorPosY').value);
+    const z = Number($('anchorPosZ').value);
+    if (![x, y, z].every(Number.isFinite)) return;
+    spatialAnchor.pos = [x, y, z];
+    // Editing pos decouples from the source row.
+    if (spatialAnchor.serial != null) {
+      spatialAnchor.serial = null;
+      spatialAnchor.label = t('ui.anchor.customLabel');
+      const lbl = $('anchorChip').querySelector('.anchor-label');
+      if (lbl) lbl.textContent = spatialAnchor.label;
+      if (selectedSerial != null) selectRow(selectedSerial);
+    }
+    applyFilters();
+  }, 250);
+  $('anchorPosX').addEventListener('input', onPosInput);
+  $('anchorPosY').addEventListener('input', onPosInput);
+  $('anchorPosZ').addEventListener('input', onPosInput);
+  $('anchorRange').addEventListener('input', debounce(() => {
+    const v = Number($('anchorRange').value);
+    if (Number.isFinite(v) && v >= 0) {
+      spatialAnchor.rangeMeters = v;
+      applyFilters();
+    }
+  }, 150));
+  $('anchorClear').addEventListener('click', () => {
+    const wasSerial = spatialAnchor.serial;
+    spatialAnchor = null;
+    renderAnchorChip();
+    applyFilters();
+    // If the previously-anchored row is currently open in the detail
+    // panel, re-render it so the anchor button label flips back.
+    if (selectedSerial === wasSerial) selectRow(selectedSerial);
+  });
+}
+
+// Create a custom (no-source-row) anchor at the origin so the user can
+// type coords into the chip. If an anchor already exists, leave its pos
+// alone and just focus the X input — letting the user re-target the
+// existing anchor's location is the more common case.
+function openCustomAnchor() {
+  if (!spatialAnchor) {
+    spatialAnchor = {
+      serial: null,
+      label: t('ui.anchor.customLabel'),
+      pos: [0, 0, 0],
+      rangeMeters: 100,
+    };
+    renderAnchorChip();
+    applyFilters();
+  }
+  setTimeout(() => {
+    const el = $('anchorPosX');
+    if (el) { el.focus(); el.select(); }
+  }, 0);
+}
+
 // ============================================================
 // DETAIL PANEL
 // ============================================================
@@ -372,12 +499,20 @@ function renderDetail(row, summary) {
   }).join('');
 
   // ---- transform ----
+  const bearing = tx ? SMDB.classify.bearingFromTransform(tx) : null;
+  const facingHtml = bearing
+    ? ` <span class="muted">(${escapeText(t('ui.detail.facing'))} ${escapeText(t('ui.compass.' + bearing, { default: bearing }))})</span>`
+    : '';
+  const isAnchored = !!spatialAnchor && spatialAnchor.serial === row.actor_serial;
   const txHtml = tx ? `
     <div class="detail-section">
       <h3>${escapeText(t('ui.detail.transformHeading'))}</h3>
       <div class="field"><label>${escapeText(t('ui.detail.position'))}</label><span class="span">${tx.pos.map(n => n.toFixed(2)).join(', ')}</span></div>
-      <div class="field"><label>${escapeText(t('ui.detail.rotation'))}</label><span class="span">${tx.rot.map(n => n.toFixed(2)).join(', ')}</span></div>
+      <div class="field"><label>${escapeText(t('ui.detail.rotation'))}</label><span class="span">${tx.rot.map(n => n.toFixed(2)).join(', ')}${facingHtml}</span></div>
       <div class="field"><label>${escapeText(t('ui.detail.scale'))}</label><span class="span">${tx.scale.map(n => n.toFixed(3)).join(', ')}</span></div>
+      <div class="toolbar">
+        <button id="anchorRow"${isAnchored ? ' disabled' : ''}>${escapeText(t(isAnchored ? 'ui.detail.anchorRowActive' : 'ui.detail.anchorRow'))}</button>
+      </div>
     </div>` : '';
 
   // ---- steam panel for player saves ----
@@ -748,6 +883,21 @@ function wireDetailEditing(row, summary, decoded) {
     $('detail').classList.add('hidden');
     $('main').classList.remove('with-detail');
     renderTable();
+  });
+
+  // anchor --------
+  $('anchorRow')?.addEventListener('click', () => {
+    const tx2 = SMDB.classify.parseTransform(row.actor_transf);
+    if (!tx2) { alert(t('ui.alert.anchorNoTransform')); return; }
+    spatialAnchor = {
+      serial: row.actor_serial,
+      label:  summary._label || ('#' + row.actor_serial),
+      pos:    tx2.pos,
+      rangeMeters: spatialAnchor ? spatialAnchor.rangeMeters : 100,
+    };
+    renderAnchorChip();
+    applyFilters();
+    selectRow(row.actor_serial);  // re-render detail so the button reflects active state
   });
 
   // steam label --------
@@ -1210,6 +1360,8 @@ $('steamCacheBtn').addEventListener('click', () => {
     if (db) renderTable();
   }
 });
+
+$('anchorAtBtn').addEventListener('click', openCustomAnchor);
 
 $('stashBtn').addEventListener('click', openStash);
 $('stashClose').addEventListener('click', () => $('stashDialog').close());

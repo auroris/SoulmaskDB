@@ -75,6 +75,7 @@ window.SMDB_LOCALES.en = {
   'ui.tableHeader.owner':           'owner',
   'ui.tableHeader.blob':            'blob',
   'ui.tableHeader.time':            'time',
+  'ui.tableHeader.distance':        'dist',
   'ui.tableEmpty':                  'no rows match',
 
   // ------------------------------------------------------------- pagination
@@ -120,6 +121,9 @@ window.SMDB_LOCALES.en = {
   'ui.detail.position':             'position',
   'ui.detail.rotation':             'rotation',
   'ui.detail.scale':                'scale',
+  'ui.detail.facing':               'facing',
+  'ui.detail.anchorRow':            '⚓ anchor for spatial query',
+  'ui.detail.anchorRowActive':      '⚓ anchored',
   'ui.detail.blobHeading':          'Blob ({size}, codec: {codec})',
   'ui.detail.blobNone':             '—',
   'ui.detail.noBlob':               'no blob',
@@ -227,6 +231,23 @@ window.SMDB_LOCALES.en = {
   'ui.alert.renumberFailed':        'renumber failed: {message}',
   'ui.alert.renumberNoSuffix':      "actor_name doesn't end in _<number>, can't renumber",
   'ui.alert.renumberExhausted':     'gave up looking for a free actor_name after 1,000,000 attempts',
+  'ui.alert.anchorNoTransform':     "can't anchor: this row has no parseable transform",
+
+  // ----------------------------------------------------------- spatial anchor
+  'ui.anchor.label':                '⚓ near #{serial} {label}',
+  'ui.anchor.customLabel':          '⚓ custom anchor',
+  'ui.anchor.atButton':             '📍 anchor at…',
+  'ui.anchor.atButton.title':       'Set a spatial anchor at specific coordinates',
+  'ui.anchor.range':                'range:',
+  'ui.anchor.clear':                'clear anchor',
+  'ui.compass.N':                   'N',
+  'ui.compass.NE':                  'NE',
+  'ui.compass.E':                   'E',
+  'ui.compass.SE':                  'SE',
+  'ui.compass.S':                   'S',
+  'ui.compass.SW':                  'SW',
+  'ui.compass.W':                   'W',
+  'ui.compass.NW':                  'NW',
 
   // ---------------------------------------------------------- collision dialog
   'ui.collision.heading':           'Row collision',
