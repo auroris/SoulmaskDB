@@ -11,3 +11,5 @@ package-lock.json
 .env*
 !.env.example
 /.claude
+/.claude
+/__pycache__

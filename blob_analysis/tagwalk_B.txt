@@ -1,0 +1,2 @@
+# property stream walk for B starting @ 14
+# parsed 0 tags, status={'error': 'read 1970435155 @ 37: only 65447 left', 'at': 14}

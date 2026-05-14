@@ -7,7 +7,12 @@
       "Bash(node --check \"C:/Users/steph/source/repos/SoulmaskDB/js/app.js\")",
       "Bash(node --check \"C:/Users/steph/source/repos/SoulmaskDB/js/classify.js\")",
       "Bash(node --check \"C:/Users/steph/source/repos/SoulmaskDB/js/locale/en.js\")",
-      "Bash(node --check \"C:/Users/steph/source/repos/SoulmaskDB/js/locale/zh.js\")"
+      "Bash(node --check \"C:/Users/steph/source/repos/SoulmaskDB/js/locale/zh.js\")",
+      "Read(//c/Users/steph/Desktop/**)",
+      "PowerShell($a = Get-Content -Raw \"C:\\\\Users\\\\steph\\\\Desktop\\\\soulmaskdb-stash.2026-05-14T01-09-20.json\" | ConvertFrom-Json; $b = Get-Content -Raw \"C:\\\\Users\\\\steph\\\\Desktop\\\\soulmaskdb-stash.2026-05-14T01-06-40.json\" | ConvertFrom-Json; Write-Output \"=== File A \\(01-09-20\\) keys ===\"; $a.PSObject.Properties.Name; Write-Output \"=== File B \\(01-06-40\\) keys ===\"; $b.PSObject.Properties.Name)",
+      "PowerShell($a = Get-Content -Raw \"C:\\\\Users\\\\steph\\\\Desktop\\\\soulmaskdb-stash.2026-05-14T01-09-20.json\" | ConvertFrom-Json; $b = Get-Content -Raw \"C:\\\\Users\\\\steph\\\\Desktop\\\\soulmaskdb-stash.2026-05-14T01-06-40.json\" | ConvertFrom-Json; Write-Output \"=== File A meta ===\"; \"format=$\\($a.format\\), version=$\\($a.version\\), exportedAt=$\\($a.exportedAt\\), entries=$\\($a.entries.Count\\)\"; Write-Output \"=== File B meta ===\"; \"format=$\\($b.format\\), version=$\\($b.version\\), exportedAt=$\\($b.exportedAt\\), entries=$\\($b.entries.Count\\)\"; Write-Output \"=== Entry keys \\(A first\\) ===\"; $a.entries[0].PSObject.Properties.Name; Write-Output \"=== Entry [0] of A \\(preview\\) ===\"; $a.entries[0] | ConvertTo-Json -Depth 4 | Select-Object -First 1 | Out-String)",
+      "Bash(python analyze_blobs.py \"C:\\\\Users\\\\steph\\\\Desktop\\\\soulmaskdb-stash.2026-05-14T01-09-20.json\" \"C:\\\\Users\\\\steph\\\\Desktop\\\\soulmaskdb-stash.2026-05-14T01-06-40.json\" blob_analysis)",
+      "Bash(python analyze_strings.py \"C:\\\\Users\\\\steph\\\\Desktop\\\\soulmaskdb-stash.2026-05-14T01-09-20.json\" \"C:\\\\Users\\\\steph\\\\Desktop\\\\soulmaskdb-stash.2026-05-14T01-06-40.json\")"
     ]
   }
 }
