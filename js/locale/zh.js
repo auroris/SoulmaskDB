@@ -102,18 +102,6 @@ window.SMDB_LOCALES.zh = {
   'ui.related.openParent':          '↑ 打开 #{serial}',
   'ui.related.openChild':           '↓ 打开 #{serial}',
 
-  // ----------------------------------------------------------- inventory panel
-  'ui.inventory.heading':           '物品栏 ({count} 格)',
-  'ui.inventory.empty':             '(空)',
-  'ui.inventory.error':             '解码错误: {message}',
-  'ui.inventory.unknownTip':        '此格的数量未存储在格位记录里(编码: {form})。真实数值依赖尚未解码的 CunDangShuXingJi 子流或每物品最大堆叠表。',
-  'ui.inventory.colIdx':            '#',
-  'ui.inventory.colSlotIdx':        '格位',
-  'ui.inventory.colCount':          '数量',
-  'ui.inventory.colClass':          '类别',
-  'ui.inventory.colForm':           '编码',
-  'ui.inventory.colGuid':           '实例 GUID',
-
   // ----------------------------------------------------------- summary line
   'ui.summary.total':               '总计',
 

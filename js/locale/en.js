@@ -154,18 +154,6 @@ window.SMDB_LOCALES.en = {
   'ui.related.openParent':          '↑ open #{serial}',
   'ui.related.openChild':           '↓ open #{serial}',
 
-  // ----------------------------------------------------------- inventory panel
-  'ui.inventory.heading':           'Inventory ({count} slots)',
-  'ui.inventory.empty':             '(empty)',
-  'ui.inventory.error':             'decode error: {message}',
-  'ui.inventory.unknownTip':        'count not stored in slot record (form: {form}). Real value needs the nested CunDangShuXingJi sub-stream or a per-item max-stack lookup, neither of which we have yet.',
-  'ui.inventory.colIdx':            '#',
-  'ui.inventory.colSlotIdx':        'slot',
-  'ui.inventory.colCount':          'count',
-  'ui.inventory.colClass':          'class',
-  'ui.inventory.colForm':           'form',
-  'ui.inventory.colGuid':           'instance GUID',
-
   // ------------------------------------------------------------ blob panel
   'ui.blob.unknownFormat':          'unknown format (header: {header})',
   'ui.blob.hexHead':                'Hex (first 4 KB of {size} B)',
@@ -177,10 +165,7 @@ window.SMDB_LOCALES.en = {
   'ui.blob.jsonParseError':         'parse error: {message}',
   'ui.blob.parseError':             'parse error: {message}',
   'ui.blob.headerMeta':             'Header / metadata',
-  'ui.blob.unrealNote':             "The body of this format uses a Soulmask-specific tagged-property layout that hasn't been fully reverse-engineered. This view shows the parsed 14-byte header and the length-prefixed FNames the format embeds literally. Writes are pass-through only.",
-  'ui.blob.unrealHeader':           'Header ({size} bytes)',
-  'ui.blob.unrealNames':            'Length-prefixed FNames ({count})',
-  'ui.blob.namesNone':              '(none)',
+  'ui.blob.properties':             'Properties ({count})',
 
   // ------------------------------------------------- structured-tree render
   'ui.tree.emptyStruct':            '(empty struct)',

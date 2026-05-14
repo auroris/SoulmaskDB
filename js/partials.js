@@ -256,85 +256,10 @@ SMDB.partials = (() => {
     },
   });
 
-  // ---- Inventory (section) -----------------------------------------------
-  // For rows whose blob has an "Entries\0" marker, decode and display the
-  // slot array using SMDB.codecInventory. Renders a small table of
-  // slot_index / count / item-class separator / instance-GUID per slot.
-  register({
-    type: 'section',
-    name: 'Inventory',
-    slot: 'postFields',
-    appliesTo: (row, decoded) => {
-      if (!row || !decoded) return false;
-      if (decoded.kind !== 'unreal-properties') return false;
-      const raw = decoded._raw;
-      if (!raw) return false;
-      return SMDB.codecInventory && SMDB.codecInventory.detect(raw);
-    },
-    render(ctx) {
-      const { t, escapeText } = ctx;
-      const raw = ctx.decoded && ctx.decoded._raw;
-      if (!raw) return '';
-      let result;
-      try {
-        result = SMDB.codecInventory.decode(raw);
-      } catch (e) {
-        return `
-          <div class="detail-section">
-            <h3>${escapeText(t('ui.inventory.heading'))}</h3>
-            <div class="danger">${escapeText(t('ui.inventory.error', { message: e.message }))}</div>
-          </div>`;
-      }
-      const { slots, notes } = result;
-      if (!slots || slots.length === 0) {
-        return `
-          <div class="detail-section">
-            <h3>${escapeText(t('ui.inventory.heading'))}</h3>
-            <div class="muted">${escapeText(t('ui.inventory.empty'))}</div>
-            ${notes.length ? notes.map(n => `<div class="muted" style="font-size:11px;">${escapeText(n)}</div>`).join('') : ''}
-          </div>`;
-      }
-      const rowsHtml = slots.map((s, i) => {
-        // count is null for implicit-max (count = item-class max stack, which
-        // we don't have a lookup for) and implicit-first (count lives in the
-        // nested sub-stream we haven't decoded). Show '?' with a tooltip
-        // pointing at the form column rather than guessing a number.
-        const countCell = s.count == null
-          ? `<span class="muted" title="${escapeText(t('ui.inventory.unknownTip', { form: s.countForm || '' }))}">?</span>`
-          : escapeText(String(s.count));
-        const guid = s.instanceGuid ? `<code style="font-size:10px;">${escapeText(s.instanceGuid)}</code>` : '<span class="muted">—</span>';
-        const slotIdx = s.slotIndex == null ? '—' : String(s.slotIndex);
-        const sepClass = s.separator || '';
-        return `
-          <tr>
-            <td>${i}</td>
-            <td>${escapeText(slotIdx)}</td>
-            <td style="text-align:right;">${countCell}</td>
-            <td><code>${escapeText(sepClass)}</code></td>
-            <td>${escapeText(s.countForm || '')}</td>
-            <td>${guid}</td>
-          </tr>`;
-      }).join('');
-      return `
-        <div class="detail-section">
-          <h3>${escapeText(t('ui.inventory.heading', { count: slots.length }))}</h3>
-          <table class="inv-table" style="width:100%; font-size:12px; border-collapse: collapse;">
-            <thead>
-              <tr>
-                <th style="text-align:left;">${escapeText(t('ui.inventory.colIdx'))}</th>
-                <th style="text-align:left;">${escapeText(t('ui.inventory.colSlotIdx'))}</th>
-                <th style="text-align:right;">${escapeText(t('ui.inventory.colCount'))}</th>
-                <th style="text-align:left;">${escapeText(t('ui.inventory.colClass'))}</th>
-                <th style="text-align:left;">${escapeText(t('ui.inventory.colForm'))}</th>
-                <th style="text-align:left;">${escapeText(t('ui.inventory.colGuid'))}</th>
-              </tr>
-            </thead>
-            <tbody>${rowsHtml}</tbody>
-          </table>
-          ${notes.length ? notes.map(n => `<div class="muted" style="font-size:11px; margin-top:4px;">${escapeText(n)}</div>`).join('') : ''}
-        </div>`;
-    },
-  });
+  // Inventory partial removed — the byte-pattern matcher it depended on
+  // (SMDB.codecInventory) was discarded once we discovered the blob body is
+  // LZ4-compressed standard UE FArchive. The inventory data is now visible
+  // in the main property tree rendered in app.js renderUnrealProperties.
 
   return { register, fieldFor, sectionsFor };
 })();

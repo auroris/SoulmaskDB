@@ -650,26 +650,40 @@ function renderJsonBlob(decoded, serial) {
 }
 
 function renderUnrealProperties(decoded, rawBlob) {
-  const h = decoded.header;
-  const headerLines = [
-    `versionTag    0x${h.versionTag.toString(16).padStart(8, '0')}  (${h.versionTag})`,
-    `headerWord1   0x${h.headerWord1.toString(16).padStart(8, '0')}  (${h.headerWord1})`,
-    `headerWord2   0x${h.headerWord2.toString(16).padStart(8, '0')}  (${h.headerWord2})`,
-    `headerExtra   0x${h.headerExtra.toString(16).padStart(4, '0')}      (${h.headerExtra})`,
-    `body bytes    ${decoded.bodySize}`,
+  const errorBanner = decoded.error
+    ? `<div class="danger" style="margin-bottom:8px;">${escapeText(t('ui.blob.parseError', { message: decoded.error }))}</div>`
+    : '';
+
+  const trailing = decoded.bodyTrailing && decoded.bodyTrailing.length > 0
+    ? `<div class="muted" style="margin-bottom:8px;">${decoded.bodyTrailing.length} bytes trailing after None terminator</div>`
+    : '';
+
+  const props = decoded.properties || [];
+  const treeHtml = props.length === 0
+    ? `<div class="muted">${escapeText(t('ui.tree.empty'))}</div>`
+    : `<div class="prop-tree">${props.map((p, i) => renderPropertyEntry(p, i, 0)).join('')}</div>`;
+
+  const meta = [
+    `outerVersionTag  0x${(decoded.outerVersionTag || 0).toString(16).padStart(8, '0')}`,
+    `innerVersionTag  0x${(decoded.innerVersionTag || 0).toString(16).padStart(8, '0')}`,
+    `compressed       ${decoded.totalSize.toLocaleString()} B`,
+    `decompressed     ${decoded.decompressedSize.toLocaleString()} B`,
+    `properties       ${props.length}`,
+    `terminated       ${decoded.terminated ? 'yes (None)' : 'no'}`,
   ].join('\n');
 
-  const namesText = decoded.names.length === 0 ? t('ui.blob.namesNone') :
-    decoded.names.map(n => `@0x${n.offset.toString(16).padStart(6, '0')}  len=${String(n.length).padStart(3)}  ${n.text}`).join('\n');
-
   return `
-    <div class="muted" style="margin-bottom:8px;">${escapeText(t('ui.blob.unrealNote'))}</div>
-    <details open><summary>${escapeText(t('ui.blob.unrealHeader', { size: SMDB.codecUnrealProperties.HEADER_SIZE }))}</summary>
-      <pre class="hex">${escapeText(headerLines)}</pre></details>
-    <details open><summary>${escapeText(t('ui.blob.unrealNames', { count: decoded.names.length }))}</summary>
-      <pre class="hex">${escapeText(namesText)}</pre></details>
+    ${errorBanner}
+    ${trailing}
+    <details open><summary>${escapeText(t('ui.blob.properties', { count: props.length }))}</summary>
+      ${treeHtml}
+    </details>
+    <details><summary>${escapeText(t('ui.blob.headerMeta'))}</summary>
+      <pre class="hex">${escapeText(meta)}</pre>
+    </details>
     <details><summary>${escapeText(t('ui.blob.hexFull', { size: decoded.totalSize.toLocaleString() }))}</summary>
-      <pre class="hex">${escapeText(hexDump(rawBlob, 0, 4096))}</pre></details>
+      <pre class="hex">${escapeText(hexDump(rawBlob, 0, 4096))}</pre>
+    </details>
   `;
 }
 
@@ -729,8 +743,15 @@ function renderValue(tag, value, depth) {
     case 'NameProperty':
       return `= <code>${escapeText(formatFName(value))}</code>`;
     case 'ObjectProperty': case 'ClassProperty':
-    case 'WeakObjectProperty': case 'LazyObjectProperty':
-      return `→ <code>${escapeText(value)}</code>`;
+    case 'WeakObjectProperty': case 'LazyObjectProperty': {
+      // Plain string = just a path; object = path + embedded property stream
+      // (Soulmask serializes the referenced object's data inline).
+      if (typeof value === 'string') return `→ <code>${escapeText(value)}</code>`;
+      const pathHtml = `→ <code>${escapeText(value.path)}</code>`;
+      if (!value.embedded || value.embedded.length === 0) return pathHtml;
+      const inner = value.embedded.map((p, i) => renderPropertyEntry(p, i, depth + 1)).join('');
+      return `${pathHtml}<div class="prop-children">${inner}</div>`;
+    }
     case 'SoftObjectProperty': case 'SoftClassProperty':
       return `→ <code>${escapeText(value.assetPath)}${value.subPath ? ':' + escapeText(value.subPath) : ''}</code>`;
     case 'ByteProperty':
