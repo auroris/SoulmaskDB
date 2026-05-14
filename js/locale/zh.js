@@ -106,7 +106,7 @@ window.SMDB_LOCALES.zh = {
   'ui.inventory.heading':           '物品栏 ({count} 格)',
   'ui.inventory.empty':             '(空)',
   'ui.inventory.error':             '解码错误: {message}',
-  'ui.inventory.placeholderTip':    '占位数量 — 首格或隐式最大堆',
+  'ui.inventory.unknownTip':        '此格的数量未存储在格位记录里(编码: {form})。真实数值依赖尚未解码的 CunDangShuXingJi 子流或每物品最大堆叠表。',
   'ui.inventory.colIdx':            '#',
   'ui.inventory.colSlotIdx':        '格位',
   'ui.inventory.colCount':          '数量',

@@ -17,7 +17,8 @@
  *   Count property (omitted on the first slot in the array):
  *     11 1f LOW                 single-byte count. The HIGH byte is
  *                               "carried" from the previous slot's 2-byte
- *                               count, starting at (max_stack >> 8).
+ *                               count, starting at the caller-supplied
+ *                               carryHighSeed (default 0).
  *     11 2f LOW HIGH            u16 LE count. Resets the carry.
  *
  *   [SEP]
@@ -38,8 +39,8 @@
  *                               of the next slot — they're shared)
  *
  * 3a 1f variant: a slot whose first tag after [SEP] is `3a 1f IDX` has no
- * count property; the count equals the item's max stack. Used heavily by
- * NPC carry bags.
+ * count property; the count equals the item's max stack. Common across all
+ * inventory kinds; see docs/blob-format.md for measured form distributions.
  *
  * Universal tags (independent of item class):
  *   11 1f = Count (u8 form)
@@ -180,17 +181,18 @@ SMDB.codecInventory = (() => {
       currentHigh = high;
       pos += 4;
     } else if (eq2(buf, pos, SLOTIDX_TAG_IMP)) {
-      rec.count = null;  // caller fills from max_stack
+      // Count equals the item-class max stack; we don't have a per-item
+      // max-stack lookup so we leave count null and let the caller decide.
+      rec.count = null;
       rec.countForm = 'implicit-max';
       rec.countBytes = '';
       rec.slotIndexTag = '3a1f';
       rec.slotIndex = buf[pos + 2];
       pos += 3;
     } else {
-      // First slot — no count or slot-idx markers. The actual count
-      // lives in the nested CunDangShuXingJi sub-stream (typically as
-      // an "Amount" property). We don't fully parse the sub-stream yet,
-      // so the caller fills in max_stack as a placeholder.
+      // First slot — no count or slot-idx markers. The actual count lives
+      // in the nested CunDangShuXingJi sub-stream as an Amount property,
+      // which we haven't decoded.
       rec.count = null;
       rec.countForm = 'implicit-first';
       rec.countBytes = '';
@@ -242,16 +244,28 @@ SMDB.codecInventory = (() => {
    *
    * @param {Uint8Array} buf       The full BG-actor blob.
    * @param {object}     opts
-   * @param {number}     opts.maxStack  Default max stack size for the
-   *                                    item type in slot 0; used to seed
-   *                                    the high-byte carry and to fill in
-   *                                    counts for implicit slots.
-   *                                    Defaults to 300 (bandages); the
-   *                                    real value is item-specific.
+   * @param {number}     opts.carryHighSeed  Initial value for the running
+   *                                    "high byte" used by the 1-byte count
+   *                                    form. The first 2-byte count in the
+   *                                    stream resets this, so the seed only
+   *                                    matters for 1B counts that appear
+   *                                    BEFORE any 2B count. Defaults to 0
+   *                                    (correct for items that don't exceed
+   *                                    a 256-stack). Stackable items with
+   *                                    larger max stacks need a higher seed
+   *                                    to decode at-max slots correctly; we
+   *                                    don't know the per-item max stack
+   *                                    from the blob, so callers pass it in
+   *                                    when they know the item class.
    * @returns {object} { slots: [...], notes: [...] }
+   *
+   * Slots whose count we can't determine from the slot record alone
+   * (`implicit-max` and `implicit-first`) are returned with `count: null`.
+   * Both depend on data we haven't decoded yet (per-item max stack for the
+   * former; the nested CunDangShuXingJi sub-stream for the latter).
    */
   function decode(buf, opts = {}) {
-    const maxStack = Number.isFinite(opts.maxStack) ? opts.maxStack : 300;
+    const carryHighSeed = Number.isFinite(opts.carryHighSeed) ? opts.carryHighSeed : 0;
     const notes = [];
     const slots = [];
 
@@ -273,14 +287,10 @@ SMDB.codecInventory = (() => {
       found.unshift({ offset: slot0Off, separator: found[0].separator });
     }
 
-    let currentHigh = maxStack >> 8;
+    let currentHigh = carryHighSeed;
     for (const f of found) {
       const { rec, currentHigh: ch } = parseSlot(buf, f.offset, f.separator, currentHigh);
       currentHigh = ch;
-      if (rec.count == null && (rec.countForm === 'implicit-max' || rec.countForm === 'implicit-first')) {
-        rec.count = maxStack;
-        rec.countIsPlaceholder = true;
-      }
       slots.push(rec);
     }
     return { slots, notes };

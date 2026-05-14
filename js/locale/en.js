@@ -158,7 +158,7 @@ window.SMDB_LOCALES.en = {
   'ui.inventory.heading':           'Inventory ({count} slots)',
   'ui.inventory.empty':             '(empty)',
   'ui.inventory.error':             'decode error: {message}',
-  'ui.inventory.placeholderTip':    'count is a placeholder — first slot or implicit-max',
+  'ui.inventory.unknownTip':        'count not stored in slot record (form: {form}). Real value needs the nested CunDangShuXingJi sub-stream or a per-item max-stack lookup, neither of which we have yet.',
   'ui.inventory.colIdx':            '#',
   'ui.inventory.colSlotIdx':        'slot',
   'ui.inventory.colCount':          'count',

@@ -295,8 +295,13 @@ SMDB.partials = (() => {
           </div>`;
       }
       const rowsHtml = slots.map((s, i) => {
-        const count = s.count == null ? '—' : String(s.count);
-        const placeholderMark = s.countIsPlaceholder ? ` <span class="muted" title="${escapeText(t('ui.inventory.placeholderTip'))}">?</span>` : '';
+        // count is null for implicit-max (count = item-class max stack, which
+        // we don't have a lookup for) and implicit-first (count lives in the
+        // nested sub-stream we haven't decoded). Show '?' with a tooltip
+        // pointing at the form column rather than guessing a number.
+        const countCell = s.count == null
+          ? `<span class="muted" title="${escapeText(t('ui.inventory.unknownTip', { form: s.countForm || '' }))}">?</span>`
+          : escapeText(String(s.count));
         const guid = s.instanceGuid ? `<code style="font-size:10px;">${escapeText(s.instanceGuid)}</code>` : '<span class="muted">—</span>';
         const slotIdx = s.slotIndex == null ? '—' : String(s.slotIndex);
         const sepClass = s.separator || '';
@@ -304,7 +309,7 @@ SMDB.partials = (() => {
           <tr>
             <td>${i}</td>
             <td>${escapeText(slotIdx)}</td>
-            <td style="text-align:right;">${escapeText(count)}${placeholderMark}</td>
+            <td style="text-align:right;">${countCell}</td>
             <td><code>${escapeText(sepClass)}</code></td>
             <td>${escapeText(s.countForm || '')}</td>
             <td>${guid}</td>

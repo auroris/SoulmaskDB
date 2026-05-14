@@ -204,10 +204,16 @@ def parse_slot(blob, start, separator, current_high):
     return rec, current_high, pos
 
 
-def decode_inventory(blob, max_stack=300, dump=True):
-    """Decode the slot array. `max_stack` is used to seed the high-byte
-    carry. Slots may have different per-class separators within the same
-    inventory; each slot's separator is detected from its own record."""
+def decode_inventory(blob, carry_high_seed=0, dump=True):
+    """Decode the slot array. `carry_high_seed` is the starting value of the
+    running high byte used by the 1-byte count form. The first 2-byte count
+    in the stream resets it, so the seed only affects 1B counts that appear
+    BEFORE any 2B count. Default 0 is correct for items that never exceed a
+    256-stack; pass (max_stack >> 8) when the caller knows the item class.
+
+    Slots whose count we can't determine from the slot record alone
+    ('3a1f-implicit' and 'implicit-first') are returned with count=None.
+    Both depend on data we haven't decoded yet."""
     arr_start = find_array_start(blob)
     if arr_start is None:
         return []
@@ -226,27 +232,23 @@ def decode_inventory(blob, max_stack=300, dump=True):
     if dump:
         print(f'Slot starts: {[(hex(o), s.hex()) for (o, s) in found]}')
 
-    max_high = max_stack >> 8
-    current_high = max_high
+    current_high = carry_high_seed
     slots = []
     for off, sep in found:
         rec, current_high, _ = parse_slot(blob, off, sep, current_high)
-        if rec['count'] is None and rec['count_form'] in ('3a1f-implicit', 'implicit-first'):
-            rec['count'] = max_stack  # placeholder — real value needs sub-stream parsing
-            rec['count_note'] = '(implicit; max_stack placeholder)'
         slots.append(rec)
     return slots
 
 
 def main():
     serial = int(sys.argv[1]) if len(sys.argv) > 1 else 39159
-    max_stack = int(sys.argv[2]) if len(sys.argv) > 2 else 300
+    carry_high_seed = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     blob = sqlite3.connect(DB).execute(
         'SELECT actor_data FROM actor_table WHERE actor_serial = ?', (serial,)
     ).fetchone()[0]
-    print(f'Decoding inventory for actor_serial={serial}, max_stack={max_stack}  ({len(blob)}B)')
+    print(f'Decoding inventory for actor_serial={serial}, carry_high_seed={carry_high_seed}  ({len(blob)}B)')
 
-    slots = decode_inventory(blob, max_stack=max_stack)
+    slots = decode_inventory(blob, carry_high_seed=carry_high_seed)
     if not slots:
         print('No slots found.')
         return
@@ -255,9 +257,7 @@ def main():
     print(f'{"slot":>4} {"idx_tag":>10} {"form":>16} {"count":>5}  sep   count_bytes  meta_ascii')
     print('-' * 95)
     for i, s in enumerate(slots):
-        cnt = str(s.get('count', '?'))
-        if 'count_note' in s:
-            cnt += ' ?'
+        cnt = '?' if s.get('count') is None else str(s['count'])
         print(f'  {i:2d} {s.get("slot_index_tag","-"):>10} {s["count_form"]:>16} {cnt:>5}  '
               f'{s["separator"]}  {s.get("count_bytes",""):8s}     {s["instance_meta_ascii"][:32]!r}')
 
