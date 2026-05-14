@@ -6,11 +6,18 @@
  *
  *   Header layout (14 bytes, LE):
  *     u32  versionTag      always 0x00000002
- *     u32  headerWord1     varies (loosely correlates with size)
- *     u32  headerWord2     near-constant (F? ?? 02 00 pattern)
+ *     u32  headerWord1     varies (loosely correlates with size — possibly
+ *                          a per-save sequence number or rolling hash)
+ *     u32  headerWord2     `?? ?? 02 00` pattern (top half always 0x0002).
+ *                          Tens of distinct values per DB; likely an
+ *                          FCustomVersion tag varying by class/instance.
  *     u16  headerExtra     always 0 in observed data
  *
  *   Body: stream of FPropertyTag + value pairs, terminated by FName "None".
+ *
+ *   See docs/blob-format.md for the full reverse-engineered layout,
+ *   especially the inventory slot-record format and the descending-order
+ *   + carry-high-byte count encoding used by stackable items.
  *
  *   FPropertyTag (UE 4.27, PropertyTag.h, with FNames as FString):
  *     FName  Name                       // FString + int32 Number
