@@ -90,6 +90,30 @@ window.SMDB_LOCALES.zh = {
   'ui.steam.openProfile':           '↗ 打开 Steam 资料页',
   'ui.steam.savePersona':           '保存显示名',
 
+  // ---------------------------------------------------------- field partials
+  'ui.partial.playerLevel.main':    '云雾森林',
+  'ui.partial.playerLevel.dlc':     '流沙之地',
+  'ui.partial.playerLevel.unknown': '未知:{value}',
+
+  // ------------------------------------------------------ related-rows panel
+  'ui.related.heading':             '关联行',
+  'ui.related.parent':              '父级',
+  'ui.related.child':               '物品栏',
+  'ui.related.openParent':          '↑ 打开 #{serial}',
+  'ui.related.openChild':           '↓ 打开 #{serial}',
+
+  // ----------------------------------------------------------- inventory panel
+  'ui.inventory.heading':           '物品栏 ({count} 格)',
+  'ui.inventory.empty':             '(空)',
+  'ui.inventory.error':             '解码错误: {message}',
+  'ui.inventory.placeholderTip':    '占位数量 — 首格或隐式最大堆',
+  'ui.inventory.colIdx':            '#',
+  'ui.inventory.colSlotIdx':        '格位',
+  'ui.inventory.colCount':          '数量',
+  'ui.inventory.colClass':          '类别',
+  'ui.inventory.colForm':           '编码',
+  'ui.inventory.colGuid':           '实例 GUID',
+
   // ----------------------------------------------------------- summary line
   'ui.summary.total':               '总计',
 

@@ -140,6 +140,32 @@ window.SMDB_LOCALES.en = {
   'ui.steam.placeholder.auto':      '{name}',
   'ui.steam.placeholder.manual':    '(open profile, paste name here)',
 
+  // ---------------------------------------------------------- field partials
+  // ui.partial.<name>.* — labels and helpers consumed by a partial in
+  // js/partials.js. Keys here mirror the partial that uses them.
+  'ui.partial.playerLevel.main':    'Cloud Mist Forest',
+  'ui.partial.playerLevel.dlc':     'Shifting Sands',
+  'ui.partial.playerLevel.unknown': 'unknown: {value}',
+
+  // ------------------------------------------------------ related-rows panel
+  'ui.related.heading':             'Related rows',
+  'ui.related.parent':              'parent',
+  'ui.related.child':               'inventory',
+  'ui.related.openParent':          '↑ open #{serial}',
+  'ui.related.openChild':           '↓ open #{serial}',
+
+  // ----------------------------------------------------------- inventory panel
+  'ui.inventory.heading':           'Inventory ({count} slots)',
+  'ui.inventory.empty':             '(empty)',
+  'ui.inventory.error':             'decode error: {message}',
+  'ui.inventory.placeholderTip':    'count is a placeholder — first slot or implicit-max',
+  'ui.inventory.colIdx':            '#',
+  'ui.inventory.colSlotIdx':        'slot',
+  'ui.inventory.colCount':          'count',
+  'ui.inventory.colClass':          'class',
+  'ui.inventory.colForm':           'form',
+  'ui.inventory.colGuid':           'instance GUID',
+
   // ------------------------------------------------------------ blob panel
   'ui.blob.unknownFormat':          'unknown format (header: {header})',
   'ui.blob.hexHead':                'Hex (first 4 KB of {size} B)',

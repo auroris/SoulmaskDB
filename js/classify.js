@@ -243,12 +243,97 @@ SMDB.classify = (() => {
     return out;
   }
 
+  // ===========================================================
+  // Parent/child relationships
+  // ===========================================================
+  //
+  // Soulmask splits "owning actor" and "inventory storage" across two
+  // adjacent SQLite rows. For workbench-style containers (chests,
+  // workstations, …) the inventory's BG-actor row is at chest_serial - 1
+  // — confirmed across our test boxes (22638↔22637, 39160↔39159, …).
+  //
+  // For players the relationship is by Steam ID:
+  //   HPlayerState.actor_name == BindBGCompActor.actor_name
+  //
+  // findRelations(row, lookupRow) returns:
+  //   { parent: row | null, children: row[] }
+  // where each entry is the lightweight `allRows` shape (no blob). The
+  // caller supplies a `(serial) => row | null` lookup and (optionally)
+  // an `allRowsIter` iterator for the Steam-ID match scan.
+  function isInventoryStorageRow(row) {
+    const s = (row && row.actor_script) || '';
+    const sl = s.toLowerCase();
+    return sl.includes('bgactor') || sl.includes('bindbgcompactor') || sl.includes('bindbgcompdongwu');
+  }
+  function isInventoryOwnerRow(row) {
+    const k = row && row._kind;
+    return k === 'container' || k === 'station' || k === 'building' ||
+           k === 'furniture' || k === 'player' || k === 'animal' || k === 'npc';
+  }
+
+  function findRelations(row, lookupRow, allRowsIter) {
+    const out = { parent: null, children: [] };
+    if (!row) return out;
+
+    // BG / BindBG actor → look for its owner.
+    if (isInventoryStorageRow(row)) {
+      // (1) Adjacent serial heuristic (chest/workbench case).
+      const cand = lookupRow(row.actor_serial + 1);
+      if (cand && isInventoryOwnerRow(cand)) {
+        out.parent = cand;
+        return out;
+      }
+      // (2) Steam-ID match for BindBGCompActor (player case).
+      if (row.actor_name && /^7656119\d{10}$/.test(row.actor_name) && allRowsIter) {
+        for (const r of allRowsIter()) {
+          if (r === row) continue;
+          if (r.actor_name === row.actor_name && r.actor_script === SCRIPT.PLAYER_STATE) {
+            out.parent = r;
+            return out;
+          }
+        }
+      }
+      // (3) actor_owner path fallback.
+      if (row.actor_owner && allRowsIter) {
+        for (const r of allRowsIter()) {
+          if (r === row) continue;
+          if (r.actor_script && row.actor_owner.includes(r.actor_script.replace(/^.*[./]/, '').replace(/_C$/, ''))) {
+            // Loose match — owner string contains the parent's class name
+            out.parent = r;
+            break;
+          }
+        }
+      }
+      return out;
+    }
+
+    // Owner row (chest, player, etc.) → look for child BG.
+    if (isInventoryOwnerRow(row)) {
+      // (1) Adjacent serial heuristic.
+      const cand = lookupRow(row.actor_serial - 1);
+      if (cand && isInventoryStorageRow(cand)) {
+        out.children.push(cand);
+      }
+      // (2) Steam-ID match for player → BindBGCompActor.
+      if (row.actor_script === SCRIPT.PLAYER_STATE && row.actor_name && allRowsIter) {
+        for (const r of allRowsIter()) {
+          if (r === row) continue;
+          if (r.actor_name === row.actor_name && isInventoryStorageRow(r)) {
+            if (!out.children.includes(r)) out.children.push(r);
+          }
+        }
+      }
+    }
+    return out;
+  }
+
   return {
     classify,
     isPlayerRow, isSystemRow,
     shortClassName, parseTransform, translateIdent,
     bearingFromTransform, distanceMeters,
     aggregateScripts,
+    findRelations, isInventoryStorageRow, isInventoryOwnerRow,
     SCRIPT, NAME, RULES,
   };
 })();

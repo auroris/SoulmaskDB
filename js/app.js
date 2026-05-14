@@ -481,42 +481,29 @@ function selectRow(serial) {
 }
 
 function renderDetail(row, summary) {
-  const tx = SMDB.classify.parseTransform(row.actor_transf);
   const blob = row.actor_data;
   const blobLen = blob ? blob.length : 0;
   const decoded = blob ? SMDB.codecs.decode(blob) : null;
+  const ctx = buildPartialCtx(row, summary, decoded);
 
   // ---- editable fields ----
+  // Each field consults the partials registry: if a field partial claims
+  // it, the partial supplies the input element (e.g. a <select> for
+  // PlayerLevel actor_level). Otherwise we fall back to the default
+  // input/textarea. The element MUST have id `f_<field>` so the generic
+  // dirty/save/revert loop in wireDetailEditing picks it up uniformly.
   const fieldsHtml = EDITABLE.map(f => {
-    const v = row[f] == null ? '' : String(row[f]);
-    const tag = (f === 'actor_name' || f === 'actor_script' || f === 'actor_transf') ? 'textarea' : 'input';
-    const open = tag === 'textarea'
-      ? `<textarea id="f_${f}" rows="2">`
-      : `<input id="f_${f}" value="${escapeAttr(v)}"${NUMERIC_FIELDS.has(f) ? ' inputmode="numeric"' : ''}>`;
-    const close = tag === 'textarea' ? `${escapeText(v)}</textarea>` : '';
+    const fp = SMDB.partials.fieldFor(row, decoded, f);
+    const inputHtml = fp ? fp.renderField(ctx, f) : defaultFieldInput(row, f);
     const hint = FIELD_HINTS[f] ? ` <span class="muted" style="font-size:11px;">(${FIELD_HINTS[f]})</span>` : '';
-    return `<div class="field" data-field="${f}"><label>${f}${hint}</label>${open}${close}</div>`;
+    return `<div class="field" data-field="${f}"><label>${f}${hint}</label>${inputHtml}</div>`;
   }).join('');
 
-  // ---- transform ----
-  const bearing = tx ? SMDB.classify.bearingFromTransform(tx) : null;
-  const facingHtml = bearing
-    ? ` <span class="muted">(${escapeText(t('ui.detail.facing'))} ${escapeText(t('ui.compass.' + bearing, { default: bearing }))})</span>`
-    : '';
-  const isAnchored = !!spatialAnchor && spatialAnchor.serial === row.actor_serial;
-  const txHtml = tx ? `
-    <div class="detail-section">
-      <h3>${escapeText(t('ui.detail.transformHeading'))}</h3>
-      <div class="field"><label>${escapeText(t('ui.detail.position'))}</label><span class="span">${tx.pos.map(n => n.toFixed(2)).join(', ')}</span></div>
-      <div class="field"><label>${escapeText(t('ui.detail.rotation'))}</label><span class="span">${tx.rot.map(n => n.toFixed(2)).join(', ')}${facingHtml}</span></div>
-      <div class="field"><label>${escapeText(t('ui.detail.scale'))}</label><span class="span">${tx.scale.map(n => n.toFixed(3)).join(', ')}</span></div>
-      <div class="toolbar">
-        <button id="anchorRow"${isAnchored ? ' disabled' : ''}>${escapeText(t(isAnchored ? 'ui.detail.anchorRowActive' : 'ui.detail.anchorRow'))}</button>
-      </div>
-    </div>` : '';
-
-  // ---- steam panel for player saves ----
-  const steamHtml = SMDB.steam.isSteamId64(row.actor_name) ? renderSteamSection(row.actor_name) : '';
+  // ---- section partials -----------------------------------------------
+  // preFields slot (between header and editable fields): Steam, …
+  // postFields slot (between editable fields and blob): Transform, …
+  const preFieldsHtml  = SMDB.partials.sectionsFor(row, decoded, 'preFields') .map(p => p.render(ctx)).join('');
+  const postFieldsHtml = SMDB.partials.sectionsFor(row, decoded, 'postFields').map(p => p.render(ctx)).join('');
 
   // ---- blob panel via codecs ----
   const blobHtml = blobLen === 0 ? `<div class="muted">${escapeText(t('ui.detail.noBlob'))}</div>` : renderBlobByCodec(decoded, row.actor_serial, blob);
@@ -531,7 +518,7 @@ function renderDetail(row, summary) {
       <div class="muted">${escapeText(summary._summary)}</div>
     </div>
 
-    ${steamHtml}
+    ${preFieldsHtml}
 
     <div class="detail-section">
       <h3>${escapeText(t('ui.detail.numeric'))}</h3>
@@ -551,42 +538,79 @@ function renderDetail(row, summary) {
       </div>
     </div>
 
-    ${txHtml}
+    ${postFieldsHtml}
 
     <div class="detail-section">
       <h3>${escapeText(t('ui.detail.blobHeading', { size: fmtBytes(blobLen), codec: decoded ? decoded.kind : t('ui.detail.blobNone') }))}</h3>
       ${blobHtml}
     </div>`;
 
+  // Wire section partials (their internal listeners) after innerHTML lands.
+  // Field partials don't need explicit wiring — the dirty/save/revert loop
+  // in wireDetailEditing handles them via the `f_<field>` id convention.
+  SMDB.partials.sectionsFor(row, decoded, 'preFields') .forEach(p => p.wire && p.wire(ctx));
+  SMDB.partials.sectionsFor(row, decoded, 'postFields').forEach(p => p.wire && p.wire(ctx));
+
   wireDetailEditing(row, summary, decoded);
 }
 
-function renderSteamSection(steamid64) {
-  const s = SMDB.steam.decompose(steamid64);
-  if (!s) return '';
-  const stored = SMDB.steam.getLabel(steamid64) || '';
-  const info = SMDB.steam.getInfo(steamid64);
-  const placeholder = info && info.personaName
-    ? t('ui.steam.placeholder.auto', { name: info.personaName })
-    : t('ui.steam.placeholder.manual');
-  const avatarHtml = info && info.avatar
-    ? `<div class="field"><label>${escapeText(t('ui.steam.avatar'))}</label><img src="${escapeAttr(info.avatar)}" alt="" referrerpolicy="no-referrer" style="width:48px; height:48px; border:1px solid var(--border); border-radius:2px;"></div>`
-    : '';
-  return `
-    <div class="detail-section">
-      <h3>${escapeText(t('ui.steam.heading'))}</h3>
-      ${avatarHtml}
-      <div class="field"><label>${escapeText(t('ui.steam.personaName'))}</label>
-        <input id="steamLabel" value="${escapeAttr(stored)}" placeholder="${escapeAttr(placeholder)}">
-      </div>
-      <div class="field"><label>${escapeText(t('ui.steam.steamid64'))}</label><span class="span">${escapeText(s.steamid64)}</span></div>
-      <div class="toolbar">
-        <a href="${s.profileUrl}" target="_blank" rel="noopener noreferrer">
-          <button type="button">${escapeText(t('ui.steam.openProfile'))}</button>
-        </a>
-        <button id="saveSteamLabel" class="primary" disabled>${escapeText(t('ui.steam.savePersona'))}</button>
-      </div>
-    </div>`;
+// Default input element for an editable column when no field partial claims
+// it. Mirrors today's flat input/textarea rules and is what the partials
+// system falls back to.
+function defaultFieldInput(row, f) {
+  const v = row[f] == null ? '' : String(row[f]);
+  const tag = (f === 'actor_name' || f === 'actor_script' || f === 'actor_transf') ? 'textarea' : 'input';
+  return tag === 'textarea'
+    ? `<textarea id="f_${f}" rows="2">${escapeText(v)}</textarea>`
+    : `<input id="f_${f}" value="${escapeAttr(v)}"${NUMERIC_FIELDS.has(f) ? ' inputmode="numeric"' : ''}>`;
+}
+
+// Build the context object passed to every partial's render/wire phase.
+// Closes over the current row, summary, decoded blob, and the module-local
+// state partials might need to read or mutate (spatialAnchor, Steam labels).
+// Exposed-on-ctx helpers keep partial files independent of app.js internals.
+function buildPartialCtx(row, summary, decoded) {
+  return {
+    row, summary, decoded,
+    t,
+    escapeText, escapeAttr,
+    fieldId: name => `f_${name}`,
+    // Look up another row by serial (returns the lightweight `allRows`
+    // entry — no blob — or null). Partials that need the raw blob should
+    // call ctx.lookupRowDetail(serial) instead.
+    lookupRow(serial) {
+      return allRows.find(r => r.actor_serial === serial) || null;
+    },
+    lookupRowDetail: getRowDetail,
+    allRowsIter() { return allRows; },
+    navigate(serial) {
+      const target = allRows.find(r => r.actor_serial === serial);
+      if (target) selectRow(serial);
+    },
+    spatial: {
+      get isAnchored() { return !!spatialAnchor && spatialAnchor.serial === row.actor_serial; },
+      setRowAsAnchor() {
+        const tx2 = SMDB.classify.parseTransform(row.actor_transf);
+        if (!tx2) { alert(t('ui.alert.anchorNoTransform')); return; }
+        spatialAnchor = {
+          serial: row.actor_serial,
+          label:  summary._label || ('#' + row.actor_serial),
+          pos:    tx2.pos,
+          rangeMeters: spatialAnchor ? spatialAnchor.rangeMeters : 100,
+        };
+        renderAnchorChip();
+        applyFilters();
+        selectRow(row.actor_serial);
+      },
+    },
+    steam: {
+      saveLabel(value) {
+        SMDB.steam.setLabel(row.actor_name, value);
+        setStatus(t('ui.status.savedPersona', { id: row.actor_name }));
+        loadRows(); applyFilters(); selectRow(row.actor_serial);
+      },
+    },
+  };
 }
 
 function renderBlobByCodec(decoded, serial, rawBlob) {
@@ -817,7 +841,14 @@ function wireDetailEditing(row, summary, decoded) {
     saveBtn.disabled = !any;
     revertBtn.disabled = !any;
   };
-  inputs.forEach(inp => inp.addEventListener('input', checkChanged));
+  // Bind both 'input' and 'change' so <select> elements supplied by field
+  // partials (e.g. PlayerLevel) participate in dirty tracking on every
+  // browser. <input>/<textarea> only fire 'input'; <select> reliably fires
+  // 'change' and modern browsers also fire 'input' — both is harmless.
+  inputs.forEach(inp => {
+    inp.addEventListener('input',  checkChanged);
+    inp.addEventListener('change', checkChanged);
+  });
 
   revertBtn.addEventListener('click', () => {
     inputs.forEach(inp => { inp.value = original[inp.id.slice(2)]; });
@@ -885,35 +916,9 @@ function wireDetailEditing(row, summary, decoded) {
     renderTable();
   });
 
-  // anchor --------
-  $('anchorRow')?.addEventListener('click', () => {
-    const tx2 = SMDB.classify.parseTransform(row.actor_transf);
-    if (!tx2) { alert(t('ui.alert.anchorNoTransform')); return; }
-    spatialAnchor = {
-      serial: row.actor_serial,
-      label:  summary._label || ('#' + row.actor_serial),
-      pos:    tx2.pos,
-      rangeMeters: spatialAnchor ? spatialAnchor.rangeMeters : 100,
-    };
-    renderAnchorChip();
-    applyFilters();
-    selectRow(row.actor_serial);  // re-render detail so the button reflects active state
-  });
-
-  // steam label --------
-  if ($('steamLabel')) {
-    const orig = SMDB.steam.getLabel(row.actor_name) || '';
-    $('steamLabel').addEventListener('input', () => {
-      $('saveSteamLabel').disabled = $('steamLabel').value === orig;
-    });
-    $('saveSteamLabel').addEventListener('click', () => {
-      SMDB.steam.setLabel(row.actor_name, $('steamLabel').value);
-      setStatus(t('ui.status.savedPersona', { id: row.actor_name }));
-      // refresh table to show new label
-      loadRows(); applyFilters();
-      selectRow(row.actor_serial);
-    });
-  }
+  // The Transform anchor button and Steam persona-label inputs are wired
+  // by their owning section partials in js/partials.js — see Transform.wire
+  // and SteamProfile.wire there.
 
   // json blob editor --------
   if ($('jsonEditor') && decoded && decoded.kind === 'json-wrapped') {
