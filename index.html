@@ -60,10 +60,17 @@
   #anchorChip input[type="number"] { padding: 1px 4px; }
   #anchorChip button { padding: 0 6px; }
   main { flex: 1; display: grid; grid-template-columns: 1fr; overflow: hidden; }
-  main.with-detail { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
+  /* Three-column grid when the detail panel is visible:
+       [table (1fr)]  [resizer (4px)]  [detail (--detail-width, default 40%)]
+     #detailResizer is a drag handle that updates --detail-width on <main>;
+     app.js wires the mousedown/move/up plus localStorage persistence. */
+  main.with-detail { grid-template-columns: minmax(0, 1fr) 4px var(--detail-width, 40%); }
   #tableWrap { overflow: auto; }
   #detail { border-left: 1px solid var(--border); overflow: auto; padding: 12px; background: var(--panel); }
   #detail.hidden { display: none; }
+  #detailResizer { background: var(--border); cursor: col-resize; user-select: none; transition: background 0.1s; display: none; }
+  main.with-detail > #detailResizer { display: block; }
+  #detailResizer:hover, #detailResizer.dragging { background: var(--accent); }
 
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th { position: sticky; top: 0; background: var(--panel2); padding: 5px 8px;
@@ -137,7 +144,13 @@
   .stash-header { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; }
   .stash-label { color: var(--text); font-weight: bold; margin-bottom: 2px; }
 
-  /* Structured property tree */
+  /* Structured property tree.
+     Leaf nodes use <div class="prop-row">. Nodes that have nested
+     children use <details class="prop-node"><summary class="prop-row">…
+     </summary><div class="prop-children">…</div></details>. Both rows
+     start with <span class="prop-chevron"></span> so the name column
+     aligns whether or not the row is expandable. */
+  .prop-tree-heading { font-size: 11px; text-transform: uppercase; letter-spacing: 0.7px; margin-bottom: 4px; }
   .prop-tree { font-size: 12px; line-height: 1.5; }
   .prop-row { padding: 1px 0; border-left: 1px solid transparent; }
   .prop-row:hover { background: #2a2d2e; }
@@ -146,6 +159,11 @@
   .prop-val  { color: var(--text); }
   .prop-val code { background: var(--bg); padding: 0 4px; border-radius: 2px; color: #ce9178; font-size: 11px; }
   .prop-children { border-left: 1px dotted var(--border); margin-left: 6px; }
+  .prop-chevron { display: inline-block; width: 12px; color: var(--muted); text-align: center; user-select: none; }
+  details.prop-node > summary { list-style: none; cursor: pointer; }
+  details.prop-node > summary::-webkit-details-marker { display: none; }
+  details.prop-node       > summary > .prop-chevron::before { content: '▸'; }
+  details.prop-node[open] > summary > .prop-chevron::before { content: '▾'; }
 
   /* Verify results */
   #verifyDialog .verify-summary { padding: 10px 14px; border-bottom: 1px solid var(--border); }
@@ -209,6 +227,7 @@
   <div id="tableWrap">
     <table id="rowsTable"><thead></thead><tbody></tbody></table>
   </div>
+  <div id="detailResizer" aria-hidden="true" role="separator" aria-orientation="vertical"></div>
   <aside id="detail" class="hidden"></aside>
 </main>
 
@@ -281,23 +300,27 @@
   </footer>
 </dialog>
 
-<script src="lib/sqlite3/sqlite3.js"></script>
-<script src="lib/lz4/lz4.js"></script>
-<script src="js/codec-json.js"></script>
-<script src="lib/unreal/io.js"></script>
-<script src="lib/unreal/primitives.js"></script>
-<script src="lib/unreal/structs.js"></script>
-<script src="lib/unreal/values.js"></script>
-<script src="lib/unreal/properties.js"></script>
-<script src="lib/unreal/blob.js"></script>
-<script src="js/codecs.js"></script>
-<script src="js/locale/en.js"></script>
-<script src="js/locale/zh.js"></script>
-<script src="js/i18n.js"></script>
-<script src="js/classify.js"></script>
-<script src="js/steam.js"></script>
-<script src="js/stash.js"></script>
-<script src="js/partials.js"></script>
-<script src="js/app.js"></script>
+<!--
+  Load order:
+    1. sqlite3.js (classic, deferred)        — exposes globalThis.sqlite3InitModule
+    2. js/bootstrap.mjs (ES module)          — populates window.SMDB.{unreal,codecs,…}
+    3. legacy IIFE scripts (classic, defer)  — consume window.SMDB.*
+
+  Module scripts are deferred by default; the legacy classic scripts opt
+  in with `defer` so all three groups execute in document order after the
+  document has been parsed. Without `defer` the classic scripts would
+  block-run during parsing (before the module bootstrap) and crash on
+  `SMDB.unreal`/`SMDB.codecs`/`SMDB.i18n` being undefined.
+-->
+<script src="lib/sqlite3/sqlite3.js" defer></script>
+<script type="module" src="js/bootstrap.mjs"></script>
+<script src="js/locale/en.js" defer></script>
+<script src="js/locale/zh.js" defer></script>
+<script src="js/i18n.js" defer></script>
+<script src="js/classify.js" defer></script>
+<script src="js/steam.js" defer></script>
+<script src="js/stash.js" defer></script>
+<script src="js/partials.js" defer></script>
+<script src="js/app.js" defer></script>
 </body>
 </html>

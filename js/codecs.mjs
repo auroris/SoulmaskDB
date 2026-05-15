@@ -1,4 +1,3 @@
-'use strict';
 /**
  * Codec registry.
  *
@@ -10,10 +9,17 @@
  *
  * Registration order matters: detect() returns the FIRST matching codec.
  * Register more specific formats before more permissive ones.
+ *
+ * The default registry below pre-registers the JSON wrapper (very specific)
+ * before the unreal-properties codec (matches anything with the right
+ * version-tag prefix). Callers wanting a custom registration order can
+ * call createRegistry() to build a fresh empty one.
  */
-window.SMDB = window.SMDB || {};
 
-SMDB.codecs = (() => {
+import { codecJson } from './codec-json.mjs';
+import { codec as codecUnrealProperties } from '../lib/unreal/blob.mjs';
+
+export function createRegistry() {
   const codecs = [];
 
   function register(codec) {
@@ -56,9 +62,11 @@ SMDB.codecs = (() => {
   function list() { return codecs.slice(); }
 
   return { register, detect, decode, encode, list };
-})();
+}
 
-// Default registrations. Order matters: JSON wrapper is very specific
-// (declaredLength === total - 4 + JSON-looking payload), so it goes first.
-SMDB.codecs.register(SMDB.codecJson);
-SMDB.codecs.register(SMDB.codecUnrealProperties);
+// Default registry (eager): JSON wrapper first because it's very specific
+// (declaredLength === total - 4 + JSON-looking payload), unreal-properties
+// after because it accepts anything starting with the right version tag.
+export const codecs = createRegistry();
+codecs.register(codecJson);
+codecs.register(codecUnrealProperties);

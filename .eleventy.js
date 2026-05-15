@@ -15,12 +15,12 @@ module.exports = function(eleventyConfig) {
   eleventyConfig.addPassthroughCopy('lib');
   eleventyConfig.addPassthroughCopy('functions');
 
-  // node-lz4 ships a UMD browser build at node_modules/lz4/build/lz4.js
-  // (declared as its `browser` entry in package.json). We surface it at
-  // /lib/lz4/lz4.js so the dep is pinned via package.json instead of
-  // bundling our own copy.
+  // The browser lz4 adapter (lib/lz4-wasm/lz4-browser.mjs) fetches this
+  // .wasm at runtime via `new URL('./lz4_wasm_bg.wasm', import.meta.url)`.
+  // Eleventy's input scan never walks node_modules, so we map it
+  // explicitly into lib/lz4-wasm/ alongside the adapter.
   eleventyConfig.addPassthroughCopy({
-    'node_modules/lz4/build/lz4.js': 'lib/lz4/lz4.js',
+    'node_modules/lz4-wasm/lz4_wasm_bg.wasm': 'lib/lz4-wasm/lz4_wasm_bg.wasm',
   });
 
   return {

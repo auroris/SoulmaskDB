@@ -55,12 +55,13 @@ function hexDump(blob, start = 0, maxBytes = 4096) {
 }
 
 // ============================================================
-// SQLITE STATE
+// UI STATE + ORCHESTRATOR
 // ============================================================
 
-let sqlite3 = null;
-let db = null;
-const VFS_NAME = 'soulmask.db';
+// The orchestrator owns the file-load lifecycle (sqlite init, blob
+// indexing, server-id detection). app.js keeps the UI-side canonical row
+// list and per-page render state — those move with the UI component
+// refactor, not this one.
 let allRows = [];
 let filtered = [];
 let currentPage = 0;
@@ -70,7 +71,7 @@ let dirty = false;
 let currentFileLabel = null;
 // server_id detected from the loaded DB. Used when pasting from stash so
 // inserted rows belong to this server, not whichever server the stash was
-// captured from. See detectServerId() for the lookup strategy.
+// captured from. Set on the orchestrator's 'rows-ready' event.
 let currentServerId = null;
 // Spatial anchor — when set, applyFilters keeps only rows whose transform
 // is within rangeMeters of pos and sorts ascending by distance. Rows
@@ -80,51 +81,53 @@ let spatialAnchor = null;  // { serial, label, pos, rangeMeters }
 
 const setStatus = msg => { $('status').textContent = msg || ''; };
 
-async function bootSqlite() {
-  if (sqlite3) return sqlite3;
-  setStatus(t('ui.status.initSqlite'));
-  sqlite3 = await globalThis.sqlite3InitModule({
-    print: (...a) => console.log('[sqlite3]', ...a),
-    printErr: (...a) => console.warn('[sqlite3]', ...a),
-  });
-  setStatus(t('ui.status.sqliteReady', { version: sqlite3.capi.sqlite3_libversion() }));
-  return sqlite3;
-}
+// Construct the orchestrator at module-load. The legacy IIFE scripts
+// (classify, steam, stash, partials) run BEFORE app.js in index.html, so
+// `SMDB.classify` is already populated. Bootstrap (js/bootstrap.mjs)
+// publishes the singleton services we plug in here.
+SMDB.orchestrator = new SMDB.Orchestrator({
+  sqliteService: SMDB.sqliteService,
+  workerService: SMDB.workerService,
+  searchService: SMDB.search,
+  classify:      SMDB.classify,
+});
+
+// Shorthand for the rest of this file. Always returns the *current*
+// handle (or null), so callers automatically see the new DB after a
+// fresh load and stale handles never linger.
+const getDb = () => SMDB.orchestrator.db();
+
+// Wire the orchestrator's file-load events to the UI. 'rows-ready'
+// happens BEFORE blob decoding finishes — that's the point of the
+// non-blocking design — so the table renders immediately on SQL columns
+// and the SearchService listener (set up in the wire-up section
+// below) re-applies the filter as decode batches stream in.
+SMDB.orchestrator.addListener((event, data) => {
+  if (event === 'rows-ready') {
+    allRows         = data.rows;
+    currentServerId = data.serverId;
+    currentFileLabel = data.label;
+    dirty           = false;
+    selectedSerial  = null;
+    spatialAnchor   = null;
+    renderAnchorChip();
+    $('detail').classList.add('hidden');
+    $('main').classList.remove('with-detail');
+    updateChrome();
+    applyFilters();
+    setStatus(t('ui.status.loaded',
+      { file: data.label, count: data.rows.length.toLocaleString() }));
+    resolvePlayerNames();
+  } else if (event === 'load-error') {
+    setStatus('');
+    alert(t('ui.alert.notSoulmaskDB', { file: data.label }));
+  }
+});
 
 async function loadFile(file) {
-  await bootSqlite();
   setStatus(t('ui.status.loadingFile', { file: file.name, size: fmtBytes(file.size) }));
   const bytes = new Uint8Array(await file.arrayBuffer());
-  loadBytes(bytes, file.name);
-}
-
-function loadBytes(bytes, label) {
-  if (db) { try { db.close(); } catch {} }
-  try { sqlite3.util.sqlite3__wasm_vfs_unlink(0, VFS_NAME); } catch {}
-  sqlite3.capi.sqlite3_js_posix_create_file(VFS_NAME, bytes);
-  db = new sqlite3.oo1.DB(VFS_NAME, 'w');
-
-  const hasTable = db.selectValue("SELECT 1 FROM sqlite_master WHERE type='table' AND name='actor_table'");
-  if (!hasTable) {
-    db.close(); db = null;
-    setStatus('');
-    alert(t('ui.alert.notSoulmaskDB', { file: label }));
-    return;
-  }
-
-  currentFileLabel = label;
-  loadRows();
-  currentServerId = detectServerId();
-  dirty = false;
-  selectedSerial = null;
-  spatialAnchor = null;
-  renderAnchorChip();
-  $('detail').classList.add('hidden');
-  $('main').classList.remove('with-detail');
-  updateChrome();
-  applyFilters();
-  setStatus(t('ui.status.loaded', { file: label, count: allRows.length.toLocaleString() }));
-  resolvePlayerNames();
+  await SMDB.orchestrator.loadFile(bytes, file.name);
 }
 
 // Fire-and-forget Steam-name resolution after a save loads. On success,
@@ -142,74 +145,35 @@ function resolvePlayerNames() {
   });
 }
 
-function loadRows() {
-  // Load all rows including blob data so we can build a per-row text index.
-  // We drop the actor_data reference after extracting strings to keep
-  // memory bounded.
-  const rows = [];
-  setStatus(t('ui.status.loadingRows'));
-  db.exec({
-    sql: `SELECT actor_serial, server_id, data_version, actor_name, actor_script,
-                 actor_owner, actor_transf, actor_time, actor_data,
-                 length(actor_data) AS blob_size
-          FROM actor_table ORDER BY actor_serial`,
-    rowMode: 'object',
-    resultRows: rows,
-  });
-  setStatus(t('ui.status.indexingBlobs', { count: rows.length.toLocaleString() }));
-  for (const r of rows) {
-    const c = SMDB.classify.classify(r);
-    r._kind = c.kind; r._label = c.label; r._summary = c.summary;
-    r._blobText = r.actor_data ? extractBlobText(r.actor_data) : '';
-    r.actor_data = null;  // release the blob — kept only the searchable text
-  }
-  allRows = rows;
-}
-
 /**
- * Lowercased newline-joined string of all printable-ASCII runs in the blob
- * (>= 4 chars). Used for substring search in the filter.
+ * Re-index a single row after a SQL/blob edit (or remove it after a
+ * delete) AND keep `allRows` in sync with what the orchestrator/search
+ * service see. The orchestrator handles the DB read + search-index
+ * update; app.js owns `allRows` until the UI refactor moves that.
  */
-function extractBlobText(blob) {
-  // Build a parallel buffer with non-ASCII bytes replaced by 0, then split
-  // on \0 and keep runs that meet the minimum length. Using
-  // String.fromCharCode.apply on chunks is roughly an order of magnitude
-  // faster than a per-byte concat loop on a 50KB blob.
-  const remap = new Uint8Array(blob.length);
-  for (let i = 0; i < blob.length; i++) {
-    const b = blob[i];
-    remap[i] = (b >= 32 && b < 127) ? b : 0;
+function reindexRow(serial) {
+  const newRow = SMDB.orchestrator.reindexRow(serial);
+  if (!newRow) {
+    // Deleted at the DB layer — drop from local state too.
+    allRows = allRows.filter(r => r.actor_serial !== serial);
+    return;
   }
-  let raw = '';
-  const CHUNK = 0x8000;
-  for (let i = 0; i < remap.length; i += CHUNK) {
-    raw += String.fromCharCode.apply(null, remap.subarray(i, Math.min(i + CHUNK, remap.length)));
-  }
-  // Keep runs of length >= 4 (skips most random byte sequences that happen
-  // to fall in the printable range).
-  const parts = raw.split('\0');
-  let out = '';
-  for (let i = 0; i < parts.length; i++) {
-    if (parts[i].length >= 4) {
-      out += (out ? '\n' : '') + parts[i];
+  const idx = allRows.findIndex(r => r.actor_serial === serial);
+  if (idx >= 0) {
+    allRows[idx] = newRow;
+  } else {
+    // New row (stash paste) — insert at the right serial-sorted position.
+    let insertAt = allRows.length;
+    for (let i = 0; i < allRows.length; i++) {
+      if (allRows[i].actor_serial > serial) { insertAt = i; break; }
     }
+    allRows.splice(insertAt, 0, newRow);
   }
-  return out.toLowerCase();
-}
-
-// world.db: server_id comes from the GAME_SETTINGS row. accounts.db has no
-// such row, so fall back to the first row's server_id — the user will likely
-// need to fix it manually via the editable field, but that's better than
-// inserting NULL.
-function detectServerId() {
-  const fromSettings = db.selectValue(
-    "SELECT server_id FROM actor_table WHERE actor_name = ?", ['GAME_SETTINGS']);
-  if (fromSettings != null) return fromSettings;
-  return db.selectValue(
-    "SELECT server_id FROM actor_table ORDER BY actor_serial LIMIT 1");
 }
 
 function getRowDetail(serial) {
+  const db = getDb();
+  if (!db) return undefined;
   const rows = [];
   db.exec({
     sql: 'SELECT * FROM actor_table WHERE actor_serial = ?',
@@ -223,6 +187,7 @@ function getRowDetail(serial) {
 function markDirty() { dirty = true; updateChrome(); }
 
 function updateChrome() {
+  const db = getDb();
   $('downloadBtn').disabled = !db;
   $('verifyAllBtn').disabled = !db;
   $('scriptsBtn').disabled = !db;
@@ -247,11 +212,15 @@ function applyFilters() {
     if (k && r._kind !== k) return false;
     if (!q) return true;
     if (String(r.actor_serial) === q) return true;
+    // SQL-column matches are always available. The blob-text match goes
+    // through SMDB.search, which returns false for rows that haven't
+    // been indexed yet — those rows simply won't blob-match until their
+    // batch lands. SearchService fires a re-render via its listener.
     return (r.actor_script || '').toLowerCase().includes(q)
         || (r.actor_name   || '').toLowerCase().includes(q)
         || (r.actor_owner  || '').toLowerCase().includes(q)
         || (r._summary     || '').toLowerCase().includes(q)
-        || (r._blobText    || '').includes(q);  // _blobText is pre-lowercased
+        || SMDB.search.matches(r.actor_serial, q);
   });
   applySpatialAnchor();
   currentPage = 0;
@@ -506,7 +475,7 @@ function renderDetail(row, summary) {
   const postFieldsHtml = SMDB.partials.sectionsFor(row, decoded, 'postFields').map(p => p.render(ctx)).join('');
 
   // ---- blob panel via codecs ----
-  const blobHtml = blobLen === 0 ? `<div class="muted">${escapeText(t('ui.detail.noBlob'))}</div>` : renderBlobByCodec(decoded, row.actor_serial, blob);
+  const blobHtml = blobLen === 0 ? `<div class="muted">${escapeText(t('ui.detail.noBlob'))}</div>` : renderBlobByCodec(decoded, row.actor_serial);
 
   $('detail').innerHTML = `
     <div class="detail-section">
@@ -607,23 +576,23 @@ function buildPartialCtx(row, summary, decoded) {
       saveLabel(value) {
         SMDB.steam.setLabel(row.actor_name, value);
         setStatus(t('ui.status.savedPersona', { id: row.actor_name }));
-        loadRows(); applyFilters(); selectRow(row.actor_serial);
+        reindexRow(row.actor_serial); applyFilters(); selectRow(row.actor_serial);
       },
     },
   };
 }
 
-function renderBlobByCodec(decoded, serial, rawBlob) {
+function renderBlobByCodec(decoded, serial) {
   if (!decoded) return `<div class="muted">${escapeText(t('ui.detail.noBlob'))}</div>`;
   if (decoded.kind === 'json-wrapped')      return renderJsonBlob(decoded, serial);
-  if (decoded.kind === 'unreal-properties') return renderUnrealProperties(decoded, rawBlob);
-  // unknown / empty
+  if (decoded.kind === 'unreal-properties') return renderUnrealProperties(decoded);
+  // Unknown / empty: show the first bytes inline since there's no
+  // structured view to render in their place.
   if (decoded._raw) {
     const header = Array.from(decoded._raw.subarray(0, 8)).map(b => b.toString(16).padStart(2, '0')).join(' ');
     return `
       <div class="muted">${escapeText(t('ui.blob.unknownFormat', { header }))}</div>
-      <details open><summary>${escapeText(t('ui.blob.hexHead', { size: decoded.totalSize.toLocaleString() }))}</summary>
-        <pre class="hex">${escapeText(hexDump(decoded._raw, 0, 4096))}</pre></details>`;
+      <pre class="hex">${escapeText(hexDump(decoded._raw, 0, 4096))}</pre>`;
   }
   return `<div class="muted">${escapeText(t('ui.detail.empty'))}</div>`;
 }
@@ -643,13 +612,10 @@ function renderJsonBlob(decoded, serial) {
       <button id="saveJsonBlob" class="primary" disabled>${escapeText(t('ui.blob.saveJson'))}</button>
       <button id="revertJsonBlob" disabled>${escapeText(t('ui.blob.revertJson'))}</button>
       <span class="muted" id="jsonStatus"></span>
-    </div>
-    <details><summary>${escapeText(t('ui.blob.headerMeta'))}</summary>
-      <pre class="hex">${escapeText(JSON.stringify(decoded.header, null, 2))}</pre>
-    </details>`;
+    </div>`;
 }
 
-function renderUnrealProperties(decoded, rawBlob) {
+function renderUnrealProperties(decoded) {
   const errorBanner = decoded.error
     ? `<div class="danger" style="margin-bottom:8px;">${escapeText(t('ui.blob.parseError', { message: decoded.error }))}</div>`
     : '';
@@ -659,51 +625,62 @@ function renderUnrealProperties(decoded, rawBlob) {
     : '';
 
   const props = decoded.properties || [];
+  const propsHeading = `<div class="prop-tree-heading muted">${escapeText(t('ui.blob.properties', { count: props.length }))}</div>`;
   const treeHtml = props.length === 0
     ? `<div class="muted">${escapeText(t('ui.tree.empty'))}</div>`
     : `<div class="prop-tree">${props.map((p, i) => renderPropertyEntry(p, i, 0)).join('')}</div>`;
 
-  const meta = [
-    `outerVersionTag  0x${(decoded.outerVersionTag || 0).toString(16).padStart(8, '0')}`,
-    `innerVersionTag  0x${(decoded.innerVersionTag || 0).toString(16).padStart(8, '0')}`,
-    `compressed       ${decoded.totalSize.toLocaleString()} B`,
-    `decompressed     ${decoded.decompressedSize.toLocaleString()} B`,
-    `properties       ${props.length}`,
-    `terminated       ${decoded.terminated ? 'yes (None)' : 'no'}`,
-  ].join('\n');
-
   return `
     ${errorBanner}
     ${trailing}
-    <details open><summary>${escapeText(t('ui.blob.properties', { count: props.length }))}</summary>
-      ${treeHtml}
-    </details>
-    <details><summary>${escapeText(t('ui.blob.headerMeta'))}</summary>
-      <pre class="hex">${escapeText(meta)}</pre>
-    </details>
-    <details><summary>${escapeText(t('ui.blob.hexFull', { size: decoded.totalSize.toLocaleString() }))}</summary>
-      <pre class="hex">${escapeText(hexDump(rawBlob, 0, 4096))}</pre>
-    </details>
+    ${propsHeading}
+    ${treeHtml}
   `;
 }
 
 // ---- structured-tree rendering -----------------------------------------
+//
+// Value renderers all return `{ inline, children }`:
+//   inline   HTML fragment shown after the property name on the same row
+//   children HTML fragment (one row per child) shown indented below, or
+//            '' for leaf values.
+//
+// renderPropertyEntry decides on markup: leaf rows are plain <div>s,
+// rows with children become <details><summary>row</summary>…</details>.
+// The native <details> toggle gives expand/collapse for free; CSS in
+// index.html turns the default marker into a chevron and hides it for
+// leaves so the name column aligns across both shapes.
 
 function renderPropertyEntry(prop, idx, depth) {
-  const t = prop.tag;
-  const typeStr = propertyTypeLabel(t);
-  const nameStr = formatFName(t.name) + (t.arrayIndex ? `[${t.arrayIndex}]` : '');
-  const valueHtml = renderValue(t, prop.value, depth);
+  // Local var name MUST NOT be `t` — that's the file-scope i18n alias and
+  // the size-mismatch branch below needs it. (renderValue() solves the
+  // same shadowing problem by using `propType`.)
+  const tag = prop.tag;
+  const typeStr = propertyTypeLabel(tag);
+  const nameStr = formatFName(tag.name) + (tag.arrayIndex ? `[${tag.arrayIndex}]` : '');
+  const { inline, children } = renderValue(tag, prop.value, depth);
   const sizeWarn = prop._sizeMismatch
     ? ` <span class="danger" title="${escapeAttr(t('ui.tree.sizeMismatchTitle'))}">⚠</span>`
     : '';
-  const guidLine = t.hasPropertyGuid ? ` <span class="muted">{${t.propertyGuid}}</span>` : '';
-  return `
-    <div class="prop-row" style="padding-left:${depth * 14}px;">
-      <span class="prop-name">${escapeText(nameStr)}</span>
-      <span class="prop-type muted">: ${escapeText(typeStr)}${guidLine}${sizeWarn}</span>
-      <span class="prop-val">${valueHtml}</span>
-    </div>`;
+  const guidLine = tag.hasPropertyGuid ? ` <span class="muted">{${tag.propertyGuid}}</span>` : '';
+  const head = `<span class="prop-chevron"></span><span class="prop-name">${escapeText(nameStr)}</span><span class="prop-type muted">: ${escapeText(typeStr)}${guidLine}${sizeWarn}</span><span class="prop-val">${inline}</span>`;
+  const pad = `padding-left:${depth * 14}px;`;
+  if (children) {
+    return `<details class="prop-node" open><summary class="prop-row" style="${pad}">${head}</summary><div class="prop-children">${children}</div></details>`;
+  }
+  return `<div class="prop-row" style="${pad}">${head}</div>`;
+}
+
+// Synthetic row for array indices, set members, and map keys: same markup
+// as renderPropertyEntry but no type/guid/size columns. Takes a fully
+// pre-rendered name string and the same {inline, children} pair.
+function renderSyntheticRow(nameHtml, inline, children, depth) {
+  const head = `<span class="prop-chevron"></span><span class="prop-name">${nameHtml}</span><span class="prop-val">${inline}</span>`;
+  const pad = `padding-left:${depth * 14}px;`;
+  if (children) {
+    return `<details class="prop-node" open><summary class="prop-row" style="${pad}">${head}</summary><div class="prop-children">${children}</div></details>`;
+  }
+  return `<div class="prop-row" style="${pad}">${head}</div>`;
 }
 
 function propertyTypeLabel(tag) {
@@ -723,43 +700,47 @@ function formatFName(n) {
   return n.number ? `${n.value}_${n.number - 1}` : n.value;
 }
 
+// Helper for leaf returns to keep the call sites short.
+const leaf = inline => ({ inline, children: '' });
+
 function renderValue(tag, value, depth) {
   const propType = tag.type.value;  // local var (shadows file-scope `t` i18n alias)
   if (value && value._opaque) {
-    return `<span class="muted">${escapeText(SMDB.i18n.t('ui.tree.opaque', { bytes: value._opaque.length, reason: value._opaqueReason || '?' }))}</span>`;
+    return leaf(`<span class="muted">${escapeText(SMDB.i18n.t('ui.tree.opaque', { bytes: value._opaque.length, reason: value._opaqueReason || '?' }))}</span>`);
   }
   switch (propType) {
     case 'IntProperty': case 'Int8Property': case 'Int16Property':
     case 'UInt16Property': case 'UInt32Property':
-      return `= <code>${value}</code>`;
+      return leaf(`= <code>${value}</code>`);
     case 'Int64Property': case 'UInt64Property':
-      return `= <code>${escapeText(String(value))}</code>`;
+      return leaf(`= <code>${escapeText(String(value))}</code>`);
     case 'FloatProperty': case 'DoubleProperty':
-      return `= <code>${Number(value).toPrecision(7)}</code>`;
+      return leaf(`= <code>${Number(value).toPrecision(7)}</code>`);
     case 'BoolProperty':
-      return `= <code>${value}</code>`;
+      return leaf(`= <code>${value}</code>`);
     case 'StrProperty':
-      return `= <code>${escapeText(JSON.stringify(value))}</code>`;
+      return leaf(`= <code>${escapeText(JSON.stringify(value))}</code>`);
     case 'NameProperty':
-      return `= <code>${escapeText(formatFName(value))}</code>`;
+      return leaf(`= <code>${escapeText(formatFName(value))}</code>`);
     case 'ObjectProperty': case 'ClassProperty':
-    case 'WeakObjectProperty': case 'LazyObjectProperty': {
+    case 'WeakObjectProperty': case 'LazyObjectProperty':
+    case 'WSObjectProperty': {
       // Plain string = just a path; object = path + embedded property stream
       // (Soulmask serializes the referenced object's data inline).
-      if (typeof value === 'string') return `→ <code>${escapeText(value)}</code>`;
+      if (typeof value === 'string') return leaf(`→ <code>${escapeText(value)}</code>`);
       const pathHtml = `→ <code>${escapeText(value.path)}</code>`;
-      if (!value.embedded || value.embedded.length === 0) return pathHtml;
+      if (!value.embedded || value.embedded.length === 0) return leaf(pathHtml);
       const inner = value.embedded.map((p, i) => renderPropertyEntry(p, i, depth + 1)).join('');
-      return `${pathHtml}<div class="prop-children">${inner}</div>`;
+      return { inline: pathHtml, children: inner };
     }
     case 'SoftObjectProperty': case 'SoftClassProperty':
-      return `→ <code>${escapeText(value.assetPath)}${value.subPath ? ':' + escapeText(value.subPath) : ''}</code>`;
+      return leaf(`→ <code>${escapeText(value.assetPath)}${value.subPath ? ':' + escapeText(value.subPath) : ''}</code>`);
     case 'ByteProperty':
-      return tag.enumName.value === 'None'
+      return leaf(tag.enumName.value === 'None'
         ? `= <code>${value}</code>`
-        : `= <code>${escapeText(formatFName(value))}</code>`;
+        : `= <code>${escapeText(formatFName(value))}</code>`);
     case 'EnumProperty':
-      return `= <code>${escapeText(formatFName(value))}</code>`;
+      return leaf(`= <code>${escapeText(formatFName(value))}</code>`);
     case 'StructProperty':
       return renderStructValue(value, depth);
     case 'ArrayProperty':
@@ -769,69 +750,74 @@ function renderValue(tag, value, depth) {
     case 'MapProperty':
       return renderMapValue(tag, value, depth);
     case 'TextProperty':
-      return `<span class="muted">${escapeText(SMDB.i18n.t('ui.tree.text', { bytes: value && value._opaque ? value._opaque.length : 0 }))}</span>`;
+      return leaf(`<span class="muted">${escapeText(SMDB.i18n.t('ui.tree.text', { bytes: value && value._opaque ? value._opaque.length : 0 }))}</span>`);
     default:
-      return `<span class="muted">${escapeText(SMDB.i18n.t('ui.tree.value', { type: propType }))}</span>`;
+      return leaf(`<span class="muted">${escapeText(SMDB.i18n.t('ui.tree.value', { type: propType }))}</span>`);
   }
 }
 
 function renderStructValue(sv, depth) {
-  if (!sv) return `<span class="muted">${escapeText(t('ui.tree.emptyStruct'))}</span>`;
+  if (!sv) return leaf(`<span class="muted">${escapeText(t('ui.tree.emptyStruct'))}</span>`);
   const name = sv._structName;
   // Known-binary struct: render compactly.
-  if (SMDB.codecUnrealProperties.STRUCT_HANDLERS[name]) {
-    return `= <code>${escapeText(JSON.stringify(sv.value))}</code>`;
+  if (SMDB.unreal.STRUCT_HANDLERS[name]) {
+    return leaf(`= <code>${escapeText(JSON.stringify(sv.value))}</code>`);
   }
-  // Unknown struct: nested properties
   if (sv._structDecodeError) {
-    return `<span class="danger">${escapeText(t('ui.tree.structDecodeError', { message: sv._structDecodeError }))}</span>`;
+    return leaf(`<span class="danger">${escapeText(t('ui.tree.structDecodeError', { message: sv._structDecodeError }))}</span>`);
   }
   if (!Array.isArray(sv.value) || sv.value.length === 0) {
-    return `<span class="muted">${escapeText(t('ui.tree.empty'))}</span>`;
+    return leaf(`<span class="muted">${escapeText(t('ui.tree.empty'))}</span>`);
   }
   const inner = sv.value.map((p, i) => renderPropertyEntry(p, i, depth + 1)).join('');
-  return `<div class="prop-children">${inner}</div>`;
+  return { inline: '', children: inner };
 }
 
 function renderArrayValue(tag, value, depth) {
   if (!value || !value.elements || value.elements.length === 0) {
-    return `<span class="muted">[]</span>`;
+    return leaf(`<span class="muted">[]</span>`);
   }
   const innerType = tag.innerType.value;
   // Show inline if elements are tiny primitives and the array is small.
   const isShortPrim = value.elements.length <= 8 && ['IntProperty','FloatProperty','BoolProperty','NameProperty','StrProperty'].includes(innerType);
   if (isShortPrim) {
-    return `= <code>${escapeText(JSON.stringify(value.elements.map(stringifyForInline)))}</code>`;
+    return leaf(`= <code>${escapeText(JSON.stringify(value.elements.map(stringifyForInline)))}</code>`);
   }
   const items = value.elements.map((e, i) => {
     if (innerType === 'StructProperty') {
-      const sv = e;
-      const inner = renderStructValue(sv, depth + 1);
-      return `<div class="prop-row" style="padding-left:${(depth+1)*14}px;">
-        <span class="prop-name">[${i}]</span>
-        <span class="prop-val">${inner}</span></div>`;
+      const { inline, children } = renderStructValue(e, depth + 1);
+      return renderSyntheticRow(`[${i}]`, inline, children, depth + 1);
     }
-    return `<div class="prop-row" style="padding-left:${(depth+1)*14}px;">
-      <span class="prop-name">[${i}]</span>
-      <span class="prop-val">= <code>${escapeText(stringifyForInline(e))}</code></span></div>`;
+    return renderSyntheticRow(`[${i}]`, `= <code>${escapeText(stringifyForInline(e))}</code>`, '', depth + 1);
   }).join('');
-  return `<span class="muted">${escapeText(t('ui.tree.items', { count: value.elements.length }))}</span><div class="prop-children">${items}</div>`;
+  return {
+    inline: `<span class="muted">${escapeText(t('ui.tree.items', { count: value.elements.length }))}</span>`,
+    children: items,
+  };
 }
 
 function renderSetValue(tag, value, depth) {
-  const items = (value.elements || []).map((e, i) =>
-    `<div class="prop-row" style="padding-left:${(depth+1)*14}px;">
-      <span class="prop-name">{${i}}</span>
-      <span class="prop-val">= <code>${escapeText(stringifyForInline(e))}</code></span></div>`).join('');
-  return `<span class="muted">${escapeText(t('ui.tree.setItems', { count: (value.elements||[]).length }))}</span><div class="prop-children">${items}</div>`;
+  const elements = value.elements || [];
+  const items = elements.map((e, i) =>
+    renderSyntheticRow(`{${i}}`, `= <code>${escapeText(stringifyForInline(e))}</code>`, '', depth + 1)
+  ).join('');
+  return {
+    inline: `<span class="muted">${escapeText(t('ui.tree.setItems', { count: elements.length }))}</span>`,
+    children: items,
+  };
 }
 
 function renderMapValue(tag, value, depth) {
-  const items = (value.entries || []).map((e, i) =>
-    `<div class="prop-row" style="padding-left:${(depth+1)*14}px;">
-      <span class="prop-name"><code>${escapeText(stringifyForInline(e.key))}</code></span>
-      <span class="prop-val"> → <code>${escapeText(stringifyForInline(e.value))}</code></span></div>`).join('');
-  return `<span class="muted">${escapeText(t('ui.tree.entries', { count: (value.entries||[]).length }))}</span><div class="prop-children">${items}</div>`;
+  const entries = value.entries || [];
+  const items = entries.map((e, i) => {
+    const keyHtml = `<code>${escapeText(stringifyForInline(e.key))}</code>`;
+    const valInline = ` → <code>${escapeText(stringifyForInline(e.value))}</code>`;
+    return renderSyntheticRow(keyHtml, valInline, '', depth + 1);
+  }).join('');
+  return {
+    inline: `<span class="muted">${escapeText(t('ui.tree.entries', { count: entries.length }))}</span>`,
+    children: items,
+  };
 }
 
 function stringifyForInline(v) {
@@ -896,24 +882,25 @@ function wireDetailEditing(row, summary, decoded) {
     if (!Object.keys(updates).length) return;
     const cols = Object.keys(updates);
     try {
-      db.exec({
+      getDb().exec({
         sql: `UPDATE actor_table SET ${cols.map(c => `${c} = ?`).join(', ')} WHERE actor_serial = ?`,
         bind: [...cols.map(c => updates[c]), row.actor_serial],
       });
     } catch (e) { alert(t('ui.alert.updateFailed', { message: e.message })); return; }
-    markDirty(); loadRows(); applyFilters(); selectRow(row.actor_serial);
+    markDirty(); reindexRow(row.actor_serial); applyFilters(); selectRow(row.actor_serial);
   });
 
   // delete --------
   $('deleteRow').addEventListener('click', () => {
     if (!confirm(t('ui.alert.confirmDeleteRow', { serial: row.actor_serial }))) return;
-    try { db.exec({ sql: 'DELETE FROM actor_table WHERE actor_serial = ?', bind: [row.actor_serial] }); }
+    const serialToRemove = row.actor_serial;
+    try { getDb().exec({ sql: 'DELETE FROM actor_table WHERE actor_serial = ?', bind: [serialToRemove] }); }
     catch (e) { alert(t('ui.alert.deleteFailed', { message: e.message })); return; }
     markDirty();
     selectedSerial = null;
     $('detail').classList.add('hidden');
     $('main').classList.remove('with-detail');
-    loadRows(); applyFilters();
+    reindexRow(serialToRemove); applyFilters();
   });
 
   // stash --------
@@ -964,9 +951,9 @@ function wireDetailEditing(row, summary, decoded) {
       const newDecoded = { ...decoded, parsed, text: JSON.stringify(parsed) };
       const newBytes = SMDB.codecs.encode(newDecoded);
       try {
-        db.exec({ sql: 'UPDATE actor_table SET actor_data = ? WHERE actor_serial = ?', bind: [newBytes, row.actor_serial] });
+        getDb().exec({ sql: 'UPDATE actor_table SET actor_data = ? WHERE actor_serial = ?', bind: [newBytes, row.actor_serial] });
       } catch (e) { alert(t('ui.alert.updateFailed', { message: e.message })); return; }
-      markDirty(); loadRows(); applyFilters(); selectRow(row.actor_serial);
+      markDirty(); reindexRow(row.actor_serial); applyFilters(); selectRow(row.actor_serial);
     });
   }
 }
@@ -1058,6 +1045,7 @@ function renumberActorName(name) {
   if (!m) throw new Error(t('ui.alert.renumberNoSuffix'));
   const prefix = m[1];
   let num = parseInt(m[2], 10);
+  const db = getDb();
   for (let i = 0; i < 1_000_000; i++) {
     num++;
     const candidate = prefix + num;
@@ -1101,6 +1089,7 @@ function showCollisionDialog({ name, existingSerial, isPlayerData, allowRenumber
 }
 
 async function pasteFromStash(id) {
+  const db = getDb();
   if (!db) { alert(t('ui.alert.loadDbFirst')); return; }
   const entry = SMDB.stash.get(id);
   if (!entry) return;
@@ -1136,7 +1125,7 @@ async function pasteFromStash(id) {
           bind: [...cols.map(c => bindings[c]), existingSerial],
         });
       } catch (e) { alert(t('ui.alert.replaceFailed', { message: e.message })); return; }
-      markDirty(); loadRows(); applyFilters();
+      markDirty(); reindexRow(existingSerial); applyFilters();
       setStatus(t('ui.status.replacedFromStash', { serial: existingSerial, label: entry.label }));
       selectRow(existingSerial);
       $('stashDialog').close();
@@ -1156,7 +1145,7 @@ async function pasteFromStash(id) {
     });
   } catch (e) { alert(t('ui.alert.insertFailed', { message: e.message })); return; }
   const newSerial = db.selectValue('SELECT last_insert_rowid()');
-  markDirty(); loadRows(); applyFilters();
+  markDirty(); reindexRow(newSerial); applyFilters();
   const statusKey = existingSerial ? 'ui.status.pastedRenumbered' : 'ui.status.pastedAsNew';
   setStatus(t(statusKey, { label: entry.label, serial: newSerial, name: bindings.actor_name }));
   selectRow(newSerial);
@@ -1198,6 +1187,7 @@ function importStashFile(file) {
  * on 12K-row DBs.
  */
 async function runVerifyAll() {
+  const db = getDb();
   if (!db) return;
   $('verifyDialog').showModal();
   $('verifySummary').textContent = t('ui.verify.loadingBlobs');
@@ -1336,9 +1326,10 @@ async function copyUnmappedScripts() {
 // ============================================================
 
 function downloadDB() {
+  const db = getDb();
   if (!db) return;
   setStatus(t('ui.status.serializing'));
-  const out = sqlite3.capi.sqlite3_js_db_export(db.pointer);
+  const out = db.export();
   const blob = new Blob([out], { type: 'application/x-sqlite3' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1365,6 +1356,29 @@ $('fileInput').addEventListener('change', e => {
 $('search').addEventListener('input', debounce(applyFilters, 200));
 $('kindFilter').addEventListener('change', applyFilters);
 $('downloadBtn').addEventListener('click', downloadDB);
+
+// As the SearchService finishes batches, re-apply the filter so newly-
+// indexed rows pick up blob-text matches. Debounced so a burst of batch
+// completions during initial indexing doesn't thrash the table render.
+// The status bar shows progress so the user knows the index is filling.
+const _refilterOnIndex = debounce(() => { if (db) applyFilters(); }, 150);
+SMDB.search.addListener((event, data) => {
+  if (event === 'batch') {
+    _refilterOnIndex();
+    if (data && data.total > 0) {
+      setStatus(t('ui.status.indexingBlobs',
+        { count: `${data.indexed.toLocaleString()} / ${data.total.toLocaleString()}` }));
+    }
+  } else if (event === 'done') {
+    _refilterOnIndex();
+    if (currentFileLabel) {
+      setStatus(t('ui.status.loaded',
+        { file: currentFileLabel, count: allRows.length.toLocaleString() }));
+    }
+  } else if (event === 'reset') {
+    _refilterOnIndex();
+  }
+});
 
 $('verifyAllBtn').addEventListener('click', runVerifyAll);
 $('verifyClose').addEventListener('click', () => $('verifyDialog').close());
@@ -1427,5 +1441,47 @@ SMDB.i18n.applyToDom();
   document.documentElement.lang = cur;
 })();
 
-bootSqlite().catch(e => setStatus(t('ui.status.sqliteInitFailed', { message: e.message })));
+// ---- detail panel resizer ----------------------------------------------
+// Drag the 4 px column between #tableWrap and #detail to rebalance the
+// split. The width lives in a CSS custom property (--detail-width) on
+// <main>, which the grid layout in index.html consumes. Persisted in
+// localStorage so the user's choice survives reloads.
+(() => {
+  const main = $('main');
+  const resizer = $('detailResizer');
+  if (!main || !resizer) return;
+
+  const saved = localStorage.getItem('smdb.detailWidth');
+  if (saved) main.style.setProperty('--detail-width', saved);
+
+  let dragging = false;
+  resizer.addEventListener('mousedown', e => {
+    dragging = true;
+    e.preventDefault();
+    resizer.classList.add('dragging');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+  });
+  window.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const rect = main.getBoundingClientRect();
+    // Clamp to keep both panes usable: at least 200 px on each side.
+    const w = Math.max(200, Math.min(rect.width - 200, rect.right - e.clientX));
+    main.style.setProperty('--detail-width', w + 'px');
+  });
+  window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove('dragging');
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    const w = main.style.getPropertyValue('--detail-width');
+    if (w) localStorage.setItem('smdb.detailWidth', w.trim());
+  });
+})();
+
+// SqliteService boots its WASM module lazily on the first sqlite.open()
+// call (inside Orchestrator.loadFile), so there's no init-on-page-load
+// step here. The chrome is still updated once so the "Choose a file"
+// empty-state renders correctly.
 updateChrome();

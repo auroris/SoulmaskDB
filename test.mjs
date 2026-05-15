@@ -1,34 +1,43 @@
-'use strict';
 /**
  * Test: load world.db and decode every actor_data blob through the codec pipeline.
  * Reports per-row errors and a final summary.
  *
  * Usage:
  *   npm run test                  (looks for world.db in the project root)
- *   node test.js /path/to/world.db
+ *   node test.mjs /path/to/world.db
+ *   node test.mjs --parallel      (also run the worker-pool path and compare)
+ *   node test.mjs --parallel=8    (override pool size; default = cpu count − 1)
  */
 
-const fs   = require('fs');
-const path = require('path');
-const vm   = require('vm');
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
-// ── Browser global shim (codec files write to window.SMDB) ──────────────────
-global.window = global;
-// vm.runInThisContext doesn't inherit module-local `require`; expose it explicitly.
-global.require = require;
+import { codecs } from './js/codecs.mjs';
+import { DecodePool } from './lib/workers/pool.mjs';
 
-// Load codec files into this context in dependency order.
-for (const rel of ['js/codec-json.js', 'js/codec-unreal-properties.js', 'js/codecs.js']) {
-  const code = fs.readFileSync(path.join(__dirname, rel), 'utf8');
-  vm.runInThisContext(code, { filename: rel });
-}
+const require = createRequire(import.meta.url);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ── CLI args ─────────────────────────────────────────────────────────────────
+const argv = process.argv.slice(2);
+const parallelArg = argv.find(a => a === '--parallel' || a.startsWith('--parallel='));
+const parallelEnabled = !!parallelArg;
+const poolSize = (() => {
+  if (!parallelArg) return 0;
+  if (parallelArg === '--parallel') return Math.max(1, (os.cpus()?.length ?? 4) - 1);
+  return Math.max(1, parseInt(parallelArg.slice('--parallel='.length), 10) || 1);
+})();
+const positional = argv.filter(a => !a.startsWith('--'));
 
 // ── Database path ────────────────────────────────────────────────────────────
-const dbPath = process.argv[2] || path.join(__dirname, 'world.db');
+const dbPath = positional[0] || path.join(__dirname, 'world.db');
 
 if (!fs.existsSync(dbPath)) {
   console.error(`ERROR: database file not found: ${dbPath}`);
-  console.error('Pass the path as an argument: node test.js /path/to/world.db');
+  console.error('Pass the path as an argument: node test.mjs /path/to/world.db');
   process.exit(1);
 }
 
@@ -44,10 +53,10 @@ try {
 }
 
 // ── Walk a decoded property tree looking for embedded struct decode errors ───
-function collectStructErrors(properties, path, out) {
+function collectStructErrors(properties, prefix, out) {
   if (!Array.isArray(properties)) return;
   for (const entry of properties) {
-    const propPath = path ? `${path}.${entry.tag?.name ?? '?'}` : (entry.tag?.name ?? '?');
+    const propPath = prefix ? `${prefix}.${entry.tag?.name ?? '?'}` : (entry.tag?.name ?? '?');
     if (entry._structDecodeError) {
       out.push(`${propPath}: struct error: ${entry._structDecodeError}`);
     }
@@ -88,12 +97,18 @@ console.log('');
 
 const stats = { total: 0, empty: 0, ok: 0, unterminated: 0, trailing: 0, error: 0, structError: 0 };
 const errors = [];
+// Per-row outcome captured during the serial pass so the parallel pass
+// can compare manifests against ground truth.
+const serialOutcomes = new Map();   // serial → { kind, decodeOk }
+
+const startMs = Date.now();
 
 for (const row of rows) {
   stats.total++;
 
   if (!row.actor_data || row.blob_len === 0) {
     stats.empty++;
+    serialOutcomes.set(row.actor_serial, { kind: 'empty', decodeOk: true });
     continue;
   }
 
@@ -102,18 +117,21 @@ for (const row of rows) {
 
   let decoded;
   try {
-    decoded = SMDB.codecs.decode(u8);
+    decoded = codecs.decode(u8);
   } catch (e) {
     stats.error++;
+    serialOutcomes.set(row.actor_serial, { kind: 'error', decodeOk: false });
     errors.push({ serial: row.actor_serial, name: row.actor_name, kind: 'throw', msg: e.message });
     continue;
   }
 
   if (decoded.error) {
     stats.error++;
+    serialOutcomes.set(row.actor_serial, { kind: decoded.kind, decodeOk: false });
     errors.push({ serial: row.actor_serial, name: row.actor_name, kind: decoded.kind, msg: decoded.error });
     continue;
   }
+  serialOutcomes.set(row.actor_serial, { kind: decoded.kind, decodeOk: true });
 
   if (decoded.kind === 'unreal-properties') {
     if (!decoded.terminated) {
@@ -144,6 +162,8 @@ for (const row of rows) {
     stats.ok++;
   }
 }
+
+const elapsedMs = Date.now() - startMs;
 
 // ── Report ───────────────────────────────────────────────────────────────────
 const problemCount = errors.length;
@@ -176,5 +196,80 @@ console.log(`  Decode errors:   ${stats.error}`);
 console.log(`  Unterminated:    ${stats.unterminated}`);
 console.log(`  Trailing bytes:  ${stats.trailing}`);
 console.log(`  Struct errors:   ${stats.structError}`);
+console.log(`  Wall clock:      ${elapsedMs} ms (${(elapsedMs / Math.max(1, stats.total - stats.empty)).toFixed(2)} ms/row)`);
 
-process.exit(problemCount > 0 ? 1 : 0);
+// ── Optional: parallel decode via worker pool ────────────────────────────────
+let parallelExitCode = 0;
+if (parallelEnabled) {
+  console.log('');
+  console.log(`=== Parallel decode (${poolSize} workers) ===`);
+
+  // Build pool inputs. Copy each blob into its OWN ArrayBuffer so transfer
+  // detaches a per-row buffer rather than the shared sqlite Buffer pool.
+  // Empty rows are skipped — they produce a trivial 'empty' manifest the
+  // serial loop already covers, and there's no point round-tripping them
+  // through a worker.
+  const items = [];
+  for (const row of rows) {
+    if (!row.actor_data || row.blob_len === 0) continue;
+    const ab = new ArrayBuffer(row.actor_data.byteLength);
+    new Uint8Array(ab).set(row.actor_data);
+    items.push({ serial: row.actor_serial, buffer: ab });
+  }
+
+  const pool = new DecodePool({ size: poolSize });
+  let parallelMs;
+  let manifests;
+  try {
+    const t0 = Date.now();
+    manifests = await pool.decodeAll(items);
+    parallelMs = Date.now() - t0;
+  } finally {
+    await pool.terminate();
+  }
+
+  // Compare each manifest against the serial outcome for the same serial.
+  let mismatches = 0;
+  for (const m of manifests) {
+    const s = serialOutcomes.get(m.serial);
+    if (!s) { mismatches++; continue; }
+    // The 'error' kind path in the worker maps to whatever decoded.kind was
+    // in the serial path when codecs.decode threw. Treat both as failures
+    // and only compare decodeOk in that case.
+    if (m.manifest.decodeOk !== s.decodeOk) mismatches++;
+    else if (m.manifest.decodeOk && m.manifest.kind !== s.kind) mismatches++;
+  }
+
+  // Haystack-index sanity: every successfully-decoded non-empty blob
+  // should produce a non-empty `text` field. Report aggregate stats and
+  // a single sample so the output makes it obvious whether the index is
+  // meaningful or trivially empty.
+  let totalChars = 0, maxChars = 0, rowsWithEmptyText = 0;
+  let sampleRow = null;
+  for (const m of manifests) {
+    const len = m.manifest.text?.length ?? 0;
+    totalChars += len;
+    if (len > maxChars) maxChars = len;
+    if (m.manifest.decodeOk && len === 0) rowsWithEmptyText++;
+    if (!sampleRow && m.manifest.decodeOk && len >= 80) sampleRow = m;
+  }
+
+  console.log(`  Items decoded:   ${manifests.length}`);
+  console.log(`  Mismatches:      ${mismatches}`);
+  console.log(`  Haystack chars:  ${totalChars.toLocaleString()} ` +
+              `(avg ${(totalChars / Math.max(1, manifests.length)).toFixed(0)}/row, max ${maxChars})`);
+  console.log(`  Rows w/ '' text: ${rowsWithEmptyText} (decoded OK but empty haystack)`);
+  console.log(`  Wall clock:      ${parallelMs} ms (${(parallelMs / Math.max(1, manifests.length)).toFixed(2)} ms/row)`);
+  console.log(`  Speedup vs ser.: ${(elapsedMs / Math.max(1, parallelMs)).toFixed(2)}x`);
+
+  if (sampleRow) {
+    const txt = sampleRow.manifest.text;
+    const snippet = txt.length > 220 ? txt.slice(0, 217) + '...' : txt;
+    console.log(`  Sample row ${sampleRow.serial} haystack (${txt.length} chars, newline-joined):`);
+    for (const line of snippet.split('\n').slice(0, 6)) console.log(`    ${line}`);
+  }
+
+  if (mismatches > 0) parallelExitCode = 1;
+}
+
+process.exit(problemCount > 0 || parallelExitCode > 0 ? 1 : 0);
