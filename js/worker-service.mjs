@@ -6,10 +6,10 @@
  *   The workers extract a small per-row manifest from each actor_data
  *   blob. Today the only consumer that reads from the manifest is the
  *   search index (the `text` field). Tomorrow there's a planned
- *   cross-row reference extractor (see HANDOFF.md and the STUB
- *   `references: []` field on the manifest). Decoupling worker
- *   ownership from search ownership lets the second consumer subscribe
- *   to the same event stream without going through search.
+ *   cross-row reference extractor (see the STUB `references: []` field
+ *   on the manifest, and the architecture notes in memory). Decoupling
+ *   worker ownership from search ownership lets the second consumer
+ *   subscribe to the same event stream without going through search.
  *
  * Lazy pool: the DecodePool is constructed on first `decode()` call.
  * Spinning up 15 module-Workers costs ~hundreds of ms (lz4-wasm init

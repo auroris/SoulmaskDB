@@ -81,16 +81,23 @@ let spatialAnchor = null;  // { serial, label, pos, rangeMeters }
 
 const setStatus = msg => { $('status').textContent = msg || ''; };
 
-// Construct the orchestrator at module-load. The legacy IIFE scripts
-// (classify, steam, stash, partials) run BEFORE app.js in index.html, so
-// `SMDB.classify` is already populated. Bootstrap (js/bootstrap.mjs)
-// publishes the singleton services we plug in here.
+// Construct the orchestrator and the data service at module-load.
+// bootstrap.mjs has finished its TLA chain by now AND all classic defer
+// scripts (classify, i18n, steam, stash, partials, locale/*) have
+// completed, so SMDB.classify is populated. Constructing here (rather
+// than earlier in bootstrap.mjs) avoids a cache-warm race where the lz4
+// wasm TLA resolves before the defer queue advances.
 SMDB.orchestrator = new SMDB.Orchestrator({
   sqliteService: SMDB.sqliteService,
   workerService: SMDB.workerService,
   searchService: SMDB.search,
   classify:      SMDB.classify,
 });
+SMDB.data = new SMDB.DataService({
+  sqliteService: SMDB.sqliteService,
+  orchestrator:  SMDB.orchestrator,
+});
+SMDB.data.init();
 
 // Shorthand for the rest of this file. Always returns the *current*
 // handle (or null), so callers automatically see the new DB after a
@@ -124,11 +131,31 @@ SMDB.orchestrator.addListener((event, data) => {
   }
 });
 
-async function loadFile(file) {
-  setStatus(t('ui.status.loadingFile', { file: file.name, size: fmtBytes(file.size) }));
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  await SMDB.orchestrator.loadFile(bytes, file.name);
-}
+// SMDB.data (DataService) owns the file-upload lifecycle: drag-drop,
+// validation, the file list dialog, and the trigger that calls into
+// orchestrator.loadFile when the user clicks Switch To. This module just
+// subscribes to the orchestrator's 'rows-ready' / 'load-error' events
+// (set up above) and the data service's 'unloaded' event (set up below).
+
+// When the active DB is removed via the data dialog, clear UI state and
+// reopen the dialog so the user can pick another file.
+SMDB.data.addListener((event /*, data */) => {
+  if (event !== 'unloaded') return;
+  allRows = [];
+  filtered = [];
+  currentServerId = null;
+  currentFileLabel = null;
+  dirty = false;
+  selectedSerial = null;
+  spatialAnchor = null;
+  renderAnchorChip();
+  $('detail').classList.add('hidden');
+  $('main').classList.remove('with-detail');
+  updateChrome();
+  applyFilters();
+  setStatus('');
+  SMDB.data.maybeAutoOpen();
+});
 
 // Fire-and-forget Steam-name resolution after a save loads. On success,
 // re-renders the table so resolved names appear in the row list. Errors
@@ -1326,33 +1353,22 @@ async function copyUnmappedScripts() {
 // ============================================================
 
 function downloadDB() {
-  const db = getDb();
-  if (!db) return;
+  if (!getDb()) return;
   setStatus(t('ui.status.serializing'));
-  const out = db.export();
-  const blob = new Blob([out], { type: 'application/x-sqlite3' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  a.href = url;
-  a.download = `world.modified.${stamp}.db`;
-  document.body.appendChild(a);
-  a.click(); a.remove();
-  URL.revokeObjectURL(url);
+  const size = SMDB.data.downloadActive();
   dirty = false;
   updateChrome();
-  setStatus(t('ui.status.exported', { size: fmtBytes(out.byteLength) }));
+  setStatus(t('ui.status.exported', { size: fmtBytes(size) }));
 }
 
 // ============================================================
 // WIRE-UP
 // ============================================================
 
-$('fileInput').addEventListener('change', e => {
-  const f = e.target.files[0];
-  if (f) loadFile(f).catch(err => { console.error(err); alert(err.message); });
-});
-
+// File picking, drag-drop, validation, and Switch-To live in SMDB.data
+// (js/data-service.mjs). The header "files" button is wired by the data
+// service itself; here we only wire features that own UI outside the
+// data dialog.
 $('search').addEventListener('input', debounce(applyFilters, 200));
 $('kindFilter').addEventListener('change', applyFilters);
 $('downloadBtn').addEventListener('click', downloadDB);
@@ -1361,7 +1377,7 @@ $('downloadBtn').addEventListener('click', downloadDB);
 // indexed rows pick up blob-text matches. Debounced so a burst of batch
 // completions during initial indexing doesn't thrash the table render.
 // The status bar shows progress so the user knows the index is filling.
-const _refilterOnIndex = debounce(() => { if (db) applyFilters(); }, 150);
+const _refilterOnIndex = debounce(() => { if (getDb()) applyFilters(); }, 150);
 SMDB.search.addListener((event, data) => {
   if (event === 'batch') {
     _refilterOnIndex();
@@ -1397,7 +1413,7 @@ $('steamCacheBtn').addEventListener('click', () => {
   if (confirm(t('ui.alert.confirmClearSteam', { count: n }))) {
     SMDB.steam.clearCache();
     updateChrome();
-    if (db) renderTable();
+    if (getDb()) renderTable();
   }
 });
 

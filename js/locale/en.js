@@ -19,6 +19,8 @@ window.SMDB_LOCALES.en = {
   'ui.header.title':                'SOULMASK world.db',
   'ui.header.verifyCodec':          'verify codec',
   'ui.header.verifyCodec.title':    'Round-trip-decode every blob and report failures',
+  'ui.header.files':                'files',
+  'ui.header.files.title':          'Open the database files dialog',
   'ui.header.scripts':              'scripts',
   'ui.header.scripts.title':        "Browse distinct actor_script values and what they classify as",
   'ui.header.steamCache':           'Steam cache ({count})',
@@ -48,7 +50,26 @@ window.SMDB_LOCALES.en = {
   'ui.filterCount':                 '{shown} / {total} rows',
 
   // ----------------------------------------------------------- initial state
-  'ui.empty.choose':                'Choose a <code>world.db</code> to begin.',
+  'ui.empty.choose':                'No database loaded. Click <b>files</b> or drop a <code>.db</code> on the page.',
+
+  // ------------------------------------------------------------- data dialog
+  // Owned by js/data-service.mjs. The dialog lists every file the user has
+  // uploaded in this page session, classifies each as world/accounts/invalid,
+  // and routes Switch-To clicks through the orchestrator.
+  'ui.data.heading':                'Database files',
+  'ui.data.close':                  'close',
+  'ui.data.empty':                  'No files yet. Drop a .db file anywhere, or add one below.',
+  'ui.data.dropHere':               'drop to add file',
+  'ui.data.addLabel':               'add file:',
+  'ui.data.download':               '⤓ download',
+  'ui.data.switchTo':               'switch to',
+  'ui.data.active':                 'active',
+  'ui.data.remove':                 'remove',
+  'ui.data.rowCount':               '{count} rows',
+  'ui.data.status.pending':         '…',
+  'ui.data.status.invalid':         'invalid',
+  'ui.data.status.world':           'world save',
+  'ui.data.status.accounts':        'accounts',
 
   // ------------------------------------------------------------- status line
   'ui.status.initSqlite':           'initializing sqlite…',

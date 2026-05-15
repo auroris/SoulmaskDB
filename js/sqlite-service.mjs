@@ -23,7 +23,8 @@
  *                         or terminated)
  */
 
-const VFS_NAME = 'soulmask.db';
+const VFS_NAME      = 'soulmask.db';
+const PEEK_VFS_NAME = 'soulmask-peek.db';
 
 export class SqliteService {
   /**
@@ -33,14 +34,19 @@ export class SqliteService {
    *   lib/sqlite3/sqlite3.js exposes when the classic script tag loads).
    * @param {string}   [options.vfsName] - virtual-filesystem name to
    *   stash the bytes under. Defaults to 'soulmask.db'.
+   * @param {string}   [options.peekVfsName] - separate VFS slot used by
+   *   peek() so validating a candidate file never disturbs the active
+   *   database. Defaults to 'soulmask-peek.db'.
    */
-  constructor({ sqlite3InitModule, vfsName = VFS_NAME } = {}) {
+  constructor({ sqlite3InitModule, vfsName = VFS_NAME, peekVfsName = PEEK_VFS_NAME } = {}) {
     this._init = sqlite3InitModule
       ?? (typeof globalThis !== 'undefined' ? globalThis.sqlite3InitModule : null);
-    this._vfsName = vfsName;
+    this._vfsName     = vfsName;
+    this._peekVfsName = peekVfsName;
     this._sqlite3 = null;          // memoized WASM instance
     this._initPromise = null;      // de-dupes concurrent boot calls
     this._currentHandle = null;
+    this._peekChain = null;        // FIFO queue for concurrent peek() calls
     this._listeners = new Set();
   }
 
@@ -97,6 +103,51 @@ export class SqliteService {
     this._currentHandle = handle;
     this._emit('opened', handle);
     return handle;
+  }
+
+  /**
+   * Close the current handle (if any) WITHOUT opening a replacement.
+   * Used when the active file is removed from the data service — any
+   * lingering DatabaseHandle reference held by other code will throw on
+   * use, surfacing the bug rather than silently writing to a different
+   * file's bytes the next time something is loaded.
+   */
+  close() {
+    if (!this._currentHandle) return;
+    const prior = this._currentHandle;
+    prior._invalidate();
+    this._currentHandle = null;
+    this._emit('closed', prior);
+  }
+
+  /**
+   * Open `bytes` in a SEPARATE VFS slot, hand the raw oo1 DB to `fn`,
+   * then unconditionally close it and unlink the slot. Used to validate
+   * a candidate file (does it parse? does it have actor_table? is it a
+   * world save or accounts DB?) without evicting whatever the user is
+   * currently browsing through open().
+   *
+   * Only one peek runs at a time (the peek VFS slot is single-occupancy).
+   * Concurrent callers chain in FIFO order via `_peekChain`.
+   */
+  async peek(bytes, fn) {
+    const sqlite3 = await this._ensureBooted();
+    const prev = this._peekChain;
+    let release;
+    this._peekChain = new Promise(r => { release = r; });
+    if (prev) { try { await prev; } catch {} }
+
+    let db = null;
+    try {
+      try { sqlite3.util.sqlite3__wasm_vfs_unlink(0, this._peekVfsName); } catch {}
+      sqlite3.capi.sqlite3_js_posix_create_file(this._peekVfsName, bytes);
+      db = new sqlite3.oo1.DB(this._peekVfsName, 'w');
+      return await fn(db);
+    } finally {
+      if (db) { try { db.close(); } catch {} }
+      try { sqlite3.util.sqlite3__wasm_vfs_unlink(0, this._peekVfsName); } catch {}
+      release();
+    }
   }
 
   /** Currently-open handle, or null. */

@@ -171,6 +171,38 @@
   #verifyDialog .verify-fail .ser { color: var(--accent); display: inline-block; min-width: 60px; }
   #verifyDialog .verify-fail .reason { color: var(--warn); }
 
+  /* Data files dialog (owned by js/data-service.mjs) */
+  #dataDialog { min-width: 640px; }
+  #dataList { padding: 12px 14px; overflow-y: auto; flex: 1; }
+  .data-empty { padding: 24px; text-align: center; }
+  .data-entry { border: 1px solid var(--border); border-radius: 3px;
+    padding: 10px 12px; margin-bottom: 8px; background: var(--bg);
+    display: grid; grid-template-columns: 1fr auto; gap: 4px 12px;
+    align-items: center; transition: border-color 0.1s; }
+  .data-entry.invalid { border-color: var(--danger); }
+  .data-entry.active  { border-color: var(--accent); }
+  .data-entry-head { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
+  .data-entry-name { color: var(--text); word-break: break-all; font-weight: bold; }
+  .data-entry-badge { font-size: 11px; padding: 1px 7px; border-radius: 8px;
+    background: var(--border); color: var(--muted); white-space: nowrap; }
+  .data-entry-badge.world    { background: #1a3a5c; color: #9cdcfe; }
+  .data-entry-badge.accounts { background: #2a4a4d; color: #4ec9b0; }
+  .data-entry-badge.invalid  { background: #5c1a1a; color: #f48771; }
+  .data-entry-badge.pending  { background: var(--border); color: var(--muted); }
+  .data-entry-meta { font-size: 11px; grid-column: 1; }
+  .data-entry-actions { grid-row: 1 / span 2; grid-column: 2;
+    display: flex; gap: 6px; align-items: center; }
+
+  /* Whole-window drop overlay shown while a file is being dragged in. */
+  #dropOverlay { position: fixed; inset: 0; background: rgba(86, 156, 214, 0.08);
+    border: 2px dashed var(--accent); pointer-events: none; z-index: 9999;
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0; transition: opacity 0.12s; }
+  #dropOverlay.visible { opacity: 1; }
+  #dropOverlay .label { background: var(--panel); border: 1px solid var(--accent);
+    border-radius: 4px; padding: 12px 24px; color: var(--accent); font-size: 14px;
+    letter-spacing: 0.5px; }
+
   /* Scripts diagnostic */
   #scriptsDialog { min-width: 760px; }
   #scriptsList table { width: 100%; border-collapse: collapse; font-size: 11px; }
@@ -186,7 +218,7 @@
 
 <header>
   <h1 data-i18n="ui.header.title">SOULMASK world.db</h1>
-  <input type="file" id="fileInput" accept=".db,.sqlite,.db3">
+  <button id="manageFilesBtn" class="primary" data-i18n="ui.header.files" data-i18n-title="ui.header.files.title" title="Open the database files dialog">files</button>
   <span id="status" class="muted"></span>
   <span class="spacer"></span>
   <select id="langSelect" data-i18n-title="ui.header.language" title="Language"></select>
@@ -234,8 +266,26 @@
 <nav id="pagination" hidden></nav>
 
 <div id="empty" class="loading">
-  <p data-i18n-html="ui.empty.choose">Choose a <code>world.db</code> to begin.</p>
+  <p data-i18n-html="ui.empty.choose">No database loaded. Click <b>files</b> or drop a <code>.db</code> on the page.</p>
 </div>
+
+<div id="dropOverlay" aria-hidden="true">
+  <div class="label" data-i18n="ui.data.dropHere">drop to add file</div>
+</div>
+
+<dialog id="dataDialog">
+  <header style="display:flex; justify-content:space-between; align-items:center;">
+    <strong data-i18n="ui.data.heading">Database files</strong>
+    <button id="dataDialogClose" data-i18n="ui.data.close">close</button>
+  </header>
+  <div id="dataList"></div>
+  <footer>
+    <label class="row-actions">
+      <span data-i18n="ui.data.addLabel">add file:</span>
+      <input type="file" id="dataFileInput" accept=".db,.sqlite,.db3" multiple style="max-width:260px;">
+    </label>
+  </footer>
+</dialog>
 
 <dialog id="verifyDialog">
   <header style="display:flex; justify-content:space-between; align-items:center; padding:10px 14px; background:var(--panel2); border-bottom:1px solid var(--border);">
@@ -304,13 +354,18 @@
   Load order:
     1. sqlite3.js (classic, deferred)        — exposes globalThis.sqlite3InitModule
     2. js/bootstrap.mjs (ES module)          — populates window.SMDB.{unreal,codecs,…}
-    3. legacy IIFE scripts (classic, defer)  — consume window.SMDB.*
+                                               and dynamically imports js/app.mjs
+                                               at the end of its evaluation
+    3. legacy IIFE scripts (classic, defer)  — populate their own SMDB.* slots
 
-  Module scripts are deferred by default; the legacy classic scripts opt
-  in with `defer` so all three groups execute in document order after the
-  document has been parsed. Without `defer` the classic scripts would
-  block-run during parsing (before the module bootstrap) and crash on
-  `SMDB.unreal`/`SMDB.codecs`/`SMDB.i18n` being undefined.
+  bootstrap.mjs uses top-level `await` (transitively via blob.mjs's lz4
+  init). Browsers do NOT block subsequent classic `defer` scripts on a
+  TLA module's promise, so app.mjs MUST NOT be a classic defer script —
+  it would run while bootstrap is still paused and crash on a missing
+  SMDB.Orchestrator. Bootstrap dynamically imports app.mjs after its
+  own evaluation completes, which guarantees the right ordering. The
+  remaining classic defer scripts (i18n, classify, …) don't depend on
+  bootstrap and are safe to run in parallel with it.
 -->
 <script src="lib/sqlite3/sqlite3.js" defer></script>
 <script type="module" src="js/bootstrap.mjs"></script>
@@ -321,6 +376,5 @@
 <script src="js/steam.js" defer></script>
 <script src="js/stash.js" defer></script>
 <script src="js/partials.js" defer></script>
-<script src="js/app.js" defer></script>
 </body>
 </html>

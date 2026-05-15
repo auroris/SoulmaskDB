@@ -7,20 +7,25 @@
  *   2. Construct the app-level service singletons (SqliteService,
  *      WorkerService, SearchService) and publish their classes.
  *   3. Re-publish everything on `window.SMDB.*` so the legacy non-module
- *      scripts (app.js, classify.js, partials.js, stash.js, steam.js,
- *      i18n.js, locale/*.js) keep working unchanged. They opt into `defer`
- *      in index.html so this module executes first.
+ *      scripts (classify.js, partials.js, stash.js, steam.js, i18n.js,
+ *      locale/*.js) can read it. They use `defer` in index.html.
+ *   4. Dynamically import the UI module (`./app.mjs`) at the end, after
+ *      everything it depends on is in place.
  *
- * Why the Orchestrator is NOT constructed here:
- *   Orchestrator needs the classify function, which lives in `js/classify.js`
- *   (a legacy IIFE). The IIFE scripts run AFTER this module due to
- *   index.html load ordering, so `SMDB.classify` doesn't exist yet at this
- *   point. App.js constructs the Orchestrator at its own initialization,
- *   when classify has landed. Bootstrap publishes the *class* via
- *   `SMDB.Orchestrator` so app.js can instantiate it without an import.
+ * Why bootstrap owns app.mjs loading:
+ *   `blob.mjs` uses top-level `await` to initialize the lz4 wasm backend.
+ *   That makes this entire module a top-level-await module. Browsers do
+ *   NOT block subsequent classic `defer` scripts on a TLA module's
+ *   promise — they keep running the defer queue while we're paused on
+ *   the wasm fetch. If app.js were a classic defer script, it would run
+ *   BEFORE this module reaches the `SMDB.Orchestrator = …` line, hitting
+ *   "SMDB.Orchestrator is not a constructor".
  *
- *   When classify.js becomes a module (part of a future modularization
- *   pass), bootstrap can take ownership of the Orchestrator instance too.
+ *   The fix is to make app a module too and import it dynamically here,
+ *   AFTER bootstrap's TLA settles and SMDB.* is fully populated. The
+ *   classic defer scripts (i18n, classify, …) populate their own
+ *   SMDB.{i18n,classify,…} slots independently and have all finished
+ *   running by the time we get to the dynamic import.
  */
 
 import { Cursor, Writer }                     from '../lib/unreal/io.mjs';
@@ -45,6 +50,7 @@ import { SqliteService, DatabaseHandle } from './sqlite-service.mjs';
 import { WorkerService }                 from './worker-service.mjs';
 import { SearchService }                 from './search-service.mjs';
 import { Orchestrator }                  from './orchestrator.mjs';
+import { DataService }                   from './data-service.mjs';
 
 const root = (typeof window !== 'undefined') ? window : globalThis;
 root.SMDB = root.SMDB || {};
@@ -80,6 +86,7 @@ root.SMDB.DatabaseHandle = DatabaseHandle;
 root.SMDB.WorkerService  = WorkerService;
 root.SMDB.SearchService  = SearchService;
 root.SMDB.Orchestrator   = Orchestrator;
+root.SMDB.DataService    = DataService;
 
 // ── Service singletons (page-scoped, lifetime = page) ──────────────────────
 // SqliteService boots the sqlite3 WASM lazily on first open(). WorkerService
@@ -91,6 +98,15 @@ root.SMDB.search        = new SearchService({
   collectStrings,
 });
 
-// Orchestrator construction happens in app.js — it needs SMDB.classify
-// (a legacy IIFE) which is loaded AFTER this module per index.html order.
-// app.js publishes the instance at SMDB.orchestrator.
+// Hand off to the UI module. Awaiting here is fine: we're already a TLA
+// module, and by the time we reach this line the classic defer scripts
+// (i18n, classify, steam, stash, partials) have all run, so app.mjs
+// sees a fully-populated SMDB.*. app.mjs constructs the Orchestrator
+// and DataService at its top level — both need defer-script state
+// (classify) that is not guaranteed to be ready earlier in bootstrap
+// when blob.mjs's TLA resolves from cache.
+await import('./app.mjs');
+
+// After app.mjs has applied i18n to the static DOM, auto-open the data
+// dialog if nothing is loaded yet — gives the user a place to land.
+root.SMDB.data.maybeAutoOpen();

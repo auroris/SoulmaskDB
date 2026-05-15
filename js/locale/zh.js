@@ -17,6 +17,8 @@ window.SMDB_LOCALES.zh = {
   // ------------------------------------------------------------- page chrome
   'ui.title':                       'Soulmask 存档浏览器',
   'ui.header.title':                'SOULMASK 存档',
+  'ui.header.files':                '文件',
+  'ui.header.files.title':          '打开数据库文件对话框',
   'ui.header.verifyCodec':          '验证编解码器',
   'ui.header.verifyCodec.title':    '对每个二进制块进行编解码往返测试并报告失败',
   'ui.header.steamCache':           'Steam 缓存 ({count})',
@@ -45,7 +47,23 @@ window.SMDB_LOCALES.zh = {
   'ui.kindFilter.other':            '其他',
 
   // ----------------------------------------------------------- initial state
-  'ui.empty.choose':                '选择一个 <code>world.db</code> 文件开始。',
+  'ui.empty.choose':                '尚未加载数据库。点击 <b>文件</b> 或将 <code>.db</code> 文件拖到页面上。',
+
+  // ------------------------------------------------------------- data dialog
+  'ui.data.heading':                '数据库文件',
+  'ui.data.close':                  '关闭',
+  'ui.data.empty':                  '尚无文件。将 .db 文件拖到页面任意位置,或在下方添加。',
+  'ui.data.dropHere':               '松开以添加文件',
+  'ui.data.addLabel':               '添加文件:',
+  'ui.data.download':               '⤓ 下载',
+  'ui.data.switchTo':               '切换至',
+  'ui.data.active':                 '当前',
+  'ui.data.remove':                 '移除',
+  'ui.data.rowCount':               '{count} 行',
+  'ui.data.status.pending':         '…',
+  'ui.data.status.invalid':         '无效',
+  'ui.data.status.world':           '世界存档',
+  'ui.data.status.accounts':        '账户库',
 
   // ------------------------------------------------------------ detail panel
   'ui.detail.close':                '关闭',
