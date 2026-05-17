@@ -118,7 +118,29 @@ rowTable.addListener((event, data) => {
   } else if (event === 'row-deselected') {
     $('detail').classList.add('hidden');
     $('main').classList.remove('with-detail');
+  } else if (event === 'kind-filter-changed') {
+    // The active-pill state lives in the summary's `.active` class —
+    // refresh that so the pill row reflects the selection driven by
+    // either the click handler below or a programmatic call.
+    if (getDb()) renderSummary();
   }
+});
+
+// Delegated click on the summary pills. The pill carries a
+// `data-kind` attribute so we don't have to thread per-pill listeners
+// through renderSummary; one listener attached once on page boot
+// survives every re-render.
+$('summary').addEventListener('click', (e) => {
+  const pill = e.target.closest('.kind-pill[data-kind]');
+  if (!pill) return;
+  rowTable.toggleKindFilter(pill.dataset.kind);
+});
+$('summary').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const pill = e.target.closest('.kind-pill[data-kind]');
+  if (!pill) return;
+  e.preventDefault();
+  rowTable.toggleKindFilter(pill.dataset.kind);
 });
 
 // Fire-and-forget Steam-name resolution after a save loads. On success,
@@ -176,15 +198,29 @@ function updateChrome() {
 // SUMMARY (RowTable owns the table itself)
 // ============================================================
 
+// Preferred render order for kinds that classify.mjs produces today.
+// Any kind seen in the data but not listed here still appears — sorted
+// alphabetically after the preferred ones — so adding a new classify
+// rule doesn't require a separate edit here.
+const KIND_PREFERRED_ORDER = ['system', 'player', 'inventory', 'npc', 'animal', 'container', 'station', 'building', 'furniture', 'vegetation', 'region', 'vehicle', 'other'];
+
 function renderSummary() {
   const rows = rowTable.rows();
   const counts = {};
   for (const r of rows) counts[r._kind] = (counts[r._kind] || 0) + 1;
-  const order = ['system', 'player', 'inventory', 'npc', 'animal', 'container', 'station', 'building', 'furniture', 'vegetation', 'region', 'vehicle', 'other'];
+  const kinds = Object.keys(counts).sort((a, b) => {
+    const ai = KIND_PREFERRED_ORDER.indexOf(a);
+    const bi = KIND_PREFERRED_ORDER.indexOf(b);
+    if (ai >= 0 && bi >= 0) return ai - bi;
+    if (ai >= 0) return -1;
+    if (bi >= 0) return 1;
+    return a.localeCompare(b);
+  });
+  const selected = rowTable.selectedKinds();
   $('summary').innerHTML = `
     <div class="stat"><span class="muted">${escapeText(t('ui.summary.total'))}</span><b>${rows.length.toLocaleString()}</b></div>
-    ${order.filter(k => counts[k]).map(k => `
-      <div class="stat"><span class="pill ${k}">${escapeText(t('ui.kind.' + k, {default: k}))}</span><b>${counts[k].toLocaleString()}</b></div>
+    ${kinds.map(k => `
+      <div class="stat"><span class="pill ${escapeAttr(k)} kind-pill${selected.has(k) ? ' active' : ''}" data-kind="${escapeAttr(k)}" role="button" tabindex="0">${escapeText(t('ui.kind.' + k, {default: k}))}</span><b>${counts[k].toLocaleString()}</b></div>
     `).join('')}
   `;
   $('summary').hidden = false;

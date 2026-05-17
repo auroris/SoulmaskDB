@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <title data-i18n="ui.title">Soulmask world.db browser</title>
 <link rel="stylesheet" href="lib/datatables.net-dt/dataTables.dataTables.css">
+<link rel="stylesheet" href="lib/datatables.net-columncontrol-dt/columnControl.dataTables.css">
+<link rel="stylesheet" href="lib/datatables.net-colreorder-dt/colReorder.dataTables.css">
 <style>
   :root {
     --bg: #1e1e1e;
@@ -16,6 +18,27 @@
     --warn: #ce9178;
     --danger: #f48771;
     --ok: #6a9955;
+
+    /* DataTables ColumnControl theming. The default stylesheet ships
+       light-on-white; map every visible surface to our dark palette so
+       header buttons aren't black on dark grey and dropdown popovers
+       aren't white. Variables come from
+       node_modules/datatables.net-columncontrol-dt/css/columnControl.dataTables.css */
+    --dtcc-button-icon_color: var(--text);
+    --dtcc-button_hover-background: rgba(255, 255, 255, 0.08);
+    --dtcc-dropdown_background: var(--panel);
+    --dtcc-dropdown_border: 1px solid var(--border);
+    --dtcc-dropdown_box-shadow: 3px 4px 10px 1px rgba(0, 0, 0, 0.6);
+    --dtcc-dropdown-button_color: var(--text);
+    --dtcc-dropdown-button_hover-background: var(--panel2);
+    --dtcc-search-icon_color: var(--text);
+    --dtcc-search-icon_hover-background: rgba(255, 255, 255, 0.08);
+    --dtcc-search-input_border: 1px solid var(--border);
+    --dtcc-search-input_background: var(--bg);
+    --dtcc-search-input_background-color: var(--bg);
+    --dtcc-spacer_border: 1px solid var(--border);
+    --dtcc-title_background: var(--panel2);
+    --dtcc-list-buttons_background: rgba(255, 255, 255, 0.04);
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
@@ -91,6 +114,10 @@
 
   .pill { display: inline-block; padding: 0 6px; border-radius: 8px; background: var(--border);
     color: var(--muted); font-size: 11px; line-height: 16px; }
+  /* Summary pills double as kind filters; visual hint + active state. */
+  .pill.kind-pill { cursor: pointer; outline: 1px solid transparent; transition: outline-color 0.1s; }
+  .pill.kind-pill:hover { outline-color: var(--accent); }
+  .pill.kind-pill.active { outline-color: currentColor; outline-width: 2px; }
   .pill.system    { background: #5c1a1a; color: #f48771; }
   .pill.player    { background: #1a3a5c; color: #9cdcfe; }
   .pill.inventory { background: #2a4a4d; color: #4ec9b0; }
@@ -141,7 +168,13 @@
      in the existing layout. We only opt into the `paging` layout block;
      no info / search / length-menu chrome is rendered. */
   #rowsTable_wrapper { display: flex; flex-direction: column; height: 100%; min-height: 0; }
-  div.dt-container div.dt-layout-row.dt-layout-table { flex: 1; min-height: 0; overflow: auto; }
+  /* The base DT stylesheet sets align-items:center on every .dt-layout-row,
+     which on a tall .dt-layout-table flex container both clips the top of
+     the table (rows pushed above the scroll origin so the first visible
+     row is mid-table) AND vertically centers a short table inside its
+     row's empty space. Force top-alignment so the table content starts
+     at the top of the scroll viewport. */
+  div.dt-container div.dt-layout-row.dt-layout-table { flex: 1; min-height: 0; overflow: auto; align-items: flex-start; }
   div.dt-container div.dt-layout-row.dt-layout-table > div { width: 100%; }
   div.dt-container div.dt-layout-row:last-child { padding: 6px 12px; border-top: 1px solid var(--border);
     background: var(--panel); margin: 0; }
@@ -163,6 +196,24 @@
     color: var(--muted) !important; opacity: 0.4; cursor: not-allowed;
   }
   div.dt-container .dt-paging .ellipsis { color: var(--muted); padding: 0 4px; }
+  /* Header / cell layout overrides:
+       1. Title text is left-aligned in every column. DataTables sets
+          `text-align: right` on `.dt-type-numeric` / `.dt-type-date`;
+          we want consistent left alignment for both header and body.
+       2. Force `flex-direction: row` on the numeric/date column headers
+          (DataTables sets row-reverse for them) so the ColumnControl
+          buttons live on the RIGHT side of the header — same side as
+          for every other column. This both prevents the "two adjacent
+          buttons" artifact between a wide non-numeric column and a
+          numeric neighbour, and keeps ColumnControl's dropdown
+          positioning working (`positionDropdown()` aligns the dropdown
+          to the button's right edge when flexDirection is `row`). */
+  table.dataTable th.dt-type-numeric, table.dataTable th.dt-type-date,
+  table.dataTable td.dt-type-numeric, table.dataTable td.dt-type-date { text-align: left; }
+  table.dataTable th.dt-type-numeric div.dt-column-header,
+  table.dataTable th.dt-type-date    div.dt-column-header,
+  table.dataTable td.dt-type-numeric div.dt-column-header,
+  table.dataTable td.dt-type-date    div.dt-column-header { flex-direction: row; }
   /* Header sort indicators — DT injects span.dt-column-order in <th>s. */
   table.dataTable thead > tr > th.dt-orderable-asc,
   table.dataTable thead > tr > th.dt-orderable-desc,
@@ -262,6 +313,34 @@
   .data-entry-actions { grid-row: 1 / span 2; grid-column: 2;
     display: flex; gap: 6px; align-items: center; }
 
+  /* Columns picker (Oracle APEX-style "Select Columns").
+       Two stacked panes: "Do not display" and "Display". Buttons between
+       them: ←/→ move the selected row across, ↑/↓ reorder within the
+       Display pane. Selection state is a single CSS class on the row. */
+  #columnsDialog { min-width: 520px; }
+  #columnsPicker {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr auto;
+    gap: 12px;
+    align-items: stretch;
+    padding: 14px;
+  }
+  .cp-pane { display: flex; flex-direction: column; min-width: 0; }
+  .cp-pane-label { font-size: 11px; color: var(--muted); text-transform: uppercase;
+    letter-spacing: 0.7px; margin-bottom: 4px; }
+  .cp-list {
+    list-style: none; padding: 4px; margin: 0;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 2px;
+    min-height: 200px; max-height: 320px; overflow: auto; flex: 1;
+  }
+  .cp-list:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
+  .cp-item { padding: 4px 8px; border-radius: 2px; cursor: pointer; user-select: none;
+    border: 1px solid transparent; }
+  .cp-item:hover { background: var(--panel2); }
+  .cp-item.selected { background: #094771; border-color: var(--accent); color: var(--text); }
+  .cp-buttons { display: flex; flex-direction: column; gap: 6px; justify-content: center; }
+  .cp-buttons button { padding: 4px 10px; min-width: 38px; }
+
   /* Whole-window drop overlay shown while a file is being dragged in. */
   #dropOverlay { position: fixed; inset: 0; background: rgba(86, 156, 214, 0.08);
     border: 2px dashed var(--accent); pointer-events: none; z-index: 9999;
@@ -301,23 +380,8 @@
 
 <section id="controls" hidden>
   <input type="search" id="search" data-i18n-placeholder="ui.search.placeholder" placeholder="filter (also searches strings inside blobs)">
-  <select id="kindFilter">
-    <option value=""           data-i18n="ui.kindFilter.all">all kinds</option>
-    <option value="system"     data-i18n="ui.kindFilter.system">system rows</option>
-    <option value="player"     data-i18n="ui.kindFilter.player">players (HPlayerState)</option>
-    <option value="inventory"  data-i18n="ui.kindFilter.inventory">inventories (BindBG)</option>
-    <option value="npc"        data-i18n="ui.kindFilter.npc">NPCs</option>
-    <option value="animal"     data-i18n="ui.kindFilter.animal">animals</option>
-    <option value="container"  data-i18n="ui.kindFilter.container">containers (chests)</option>
-    <option value="station"    data-i18n="ui.kindFilter.station">stations (workbenches/lights)</option>
-    <option value="building"   data-i18n="ui.kindFilter.building">buildings</option>
-    <option value="furniture"  data-i18n="ui.kindFilter.furniture">furniture</option>
-    <option value="vegetation" data-i18n="ui.kindFilter.vegetation">vegetation / farm plots</option>
-    <option value="region"     data-i18n="ui.kindFilter.region">regions (JianZhuPianQu)</option>
-    <option value="vehicle"    data-i18n="ui.kindFilter.vehicle">ships / vehicles</option>
-    <option value="other"      data-i18n="ui.kindFilter.other">other</option>
-  </select>
   <span id="filterCount" class="muted"></span>
+  <button id="columnsBtn" title="Choose which columns to display and their order">columns…</button>
   <button id="anchorAtBtn" data-i18n="ui.anchor.atButton" data-i18n-title="ui.anchor.atButton.title">📍 anchor at…</button>
   <span id="anchorChip" class="hidden"></span>
   <span id="relationshipChip" class="hidden"></span>
@@ -399,6 +463,35 @@
   </footer>
 </dialog>
 
+<dialog id="columnsDialog">
+  <header style="display:flex; justify-content:space-between; align-items:center;">
+    <strong>Columns</strong>
+    <button id="columnsDialogClose">close</button>
+  </header>
+  <div id="columnsPicker">
+    <div class="cp-pane">
+      <div class="cp-pane-label">Do not display</div>
+      <ol id="cpHiddenList" class="cp-list" tabindex="0"></ol>
+    </div>
+    <div class="cp-buttons">
+      <button id="cpMoveRight" title="Show selected column" disabled>→</button>
+      <button id="cpMoveLeft"  title="Hide selected column" disabled>←</button>
+    </div>
+    <div class="cp-pane">
+      <div class="cp-pane-label">Display</div>
+      <ol id="cpDisplayedList" class="cp-list" tabindex="0"></ol>
+    </div>
+    <div class="cp-buttons">
+      <button id="cpMoveUp"   title="Move selected column earlier" disabled>↑</button>
+      <button id="cpMoveDown" title="Move selected column later"   disabled>↓</button>
+    </div>
+  </div>
+  <footer>
+    <span class="spacer" style="flex:1;"></span>
+    <button id="columnsDialogReset">reset to defaults</button>
+  </footer>
+</dialog>
+
 <dialog id="stashDialog">
   <header style="display:flex; justify-content:space-between; align-items:center;">
     <strong data-i18n="ui.stash.heading">Row stash</strong>
@@ -441,10 +534,14 @@
 <script type="importmap">
 {
   "imports": {
-    "jquery":             "/lib/jquery/jquery.module.js",
-    "datatables.net":     "/lib/datatables.net/dataTables.mjs",
-    "datatables.net-dt":  "/lib/datatables.net-dt/dataTables.dataTables.mjs",
-    "flexsearch":         "/lib/flexsearch/flexsearch.module.mjs"
+    "jquery":                            "/lib/jquery/jquery.module.js",
+    "datatables.net":                    "/lib/datatables.net/dataTables.mjs",
+    "datatables.net-dt":                 "/lib/datatables.net-dt/dataTables.dataTables.mjs",
+    "datatables.net-columncontrol":      "/lib/datatables.net-columncontrol/dataTables.columnControl.mjs",
+    "datatables.net-columncontrol-dt":   "/lib/datatables.net-columncontrol-dt/columnControl.dataTables.mjs",
+    "datatables.net-colreorder":         "/lib/datatables.net-colreorder/dataTables.colReorder.mjs",
+    "datatables.net-colreorder-dt":      "/lib/datatables.net-colreorder-dt/colReorder.dataTables.mjs",
+    "flexsearch":                        "/lib/flexsearch/flexsearch.module.mjs"
   }
 }
 </script>

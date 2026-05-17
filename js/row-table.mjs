@@ -41,7 +41,51 @@
 
 import $ from 'jquery';
 import DataTable from 'datatables.net-dt';
+// Side-effect imports: register the ColumnControl + ColReorder features
+// on the DataTable already imported above. The -dt variants pull in the
+// core extension and apply the matching default-theme styles (CSS links
+// in index.html). ColumnControl drives the per-column header menu (sort,
+// per-column search, etc.) and ColReorder lets the picker dialog move
+// columns left/right via dt.colReorder.move().
+import 'datatables.net-columncontrol-dt';
+import 'datatables.net-colreorder-dt';
 import { escapeText, escapeAttr, debounce, fmtBytes } from './util.mjs';
+
+// Register a plain-text search content type with ColumnControl. The
+// stock `searchText` always renders an operator <select> ("Contains",
+// "Equals", "Starts", "Ends", "Empty", "Not empty", …). For columns
+// whose values are short identifiers (e.g. actor_serial), the operators
+// don't carry their weight — a single textbox that filters
+// case-insensitively by substring is what the user wants. Behaviour
+// matches FixedSearch: writes to `column.search.fixed('dtcc', term)`
+// so it composes with the built-in extension search slot the other
+// content types use.
+if (DataTable.ColumnControl && !DataTable.ColumnControl.content.searchPlain) {
+  DataTable.ColumnControl.content.searchPlain = {
+    defaults: {
+      placeholder: '',
+      className: 'dtcc-content dtcc-searchPlain',
+    },
+    init(config) {
+      const dt = this.dt();
+      const colIdx = this.idx();
+      const wrapper = document.createElement('div');
+      wrapper.className = config.className;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'dtcc-input';
+      if (config.placeholder) input.placeholder = config.placeholder;
+      wrapper.appendChild(input);
+      const apply = () => {
+        const v = input.value || '';
+        dt.column(colIdx).search.fixed('dtcc', v.length ? v.toLowerCase() : '');
+        dt.draw();
+      };
+      input.addEventListener('input', apply);
+      return wrapper;
+    },
+  };
+}
 
 const PAGE_SIZE = 200;
 
@@ -70,6 +114,13 @@ export class RowTable {
     // we use it to clear the filter automatically if that row's selection
     // moves off, and to render a useful chip label.
     this._relationshipFilter = null;   // { label, kind, originSerial, serials: Set<number> }
+
+    // Kind filter — driven by the summary pills above the filter input
+    // (app.mjs makes them clickable). We track the selected set here so
+    // pill rendering can show an "active" state, and we sync the kind
+    // column's ColumnControl `searchList` to match — the column dropdown
+    // and the pill row stay in step.
+    this._selectedKinds = new Set();
 
     this._listeners = new Set();
     this._dtApi     = null;
@@ -139,6 +190,74 @@ export class RowTable {
   relationshipFilter() { return this._relationshipFilter; }
   currentFileLabel() { return this._currentFileLabel; }
   currentServerId()  { return this._currentServerId; }
+  selectedKinds() { return new Set(this._selectedKinds); }
+
+  /**
+   * Toggle a single kind in the kind-column filter. Updates our internal
+   * state, syncs the kind column's ColumnControl `searchList` so its
+   * dropdown checkboxes mirror the pill row, and re-draws the table.
+   * Emits `kind-filter-changed` with the new set so app.mjs can update
+   * the pill row's active states.
+   *
+   * Kept in row-table because the column-index ↔ ColumnControl wiring
+   * lives here. app.mjs's pill row is the only caller today.
+   */
+  toggleKindFilter(kind) {
+    if (this._selectedKinds.has(kind)) this._selectedKinds.delete(kind);
+    else                                this._selectedKinds.add(kind);
+    this._applyKindFilterToColumn();
+    this._emit('kind-filter-changed', { kinds: new Set(this._selectedKinds) });
+  }
+
+  clearKindFilter() {
+    if (this._selectedKinds.size === 0) return;
+    this._selectedKinds.clear();
+    this._applyKindFilterToColumn();
+    this._emit('kind-filter-changed', { kinds: new Set() });
+  }
+
+  /**
+   * Push `this._selectedKinds` into the kind column's ColumnControl
+   * searchList. Strategy:
+   *   1. `column.columnControl.searchClear()` deselects every checkbox
+   *      (via the `cc-search-clear` event the CheckList listens to) and
+   *      drops the `dtcc-list` fixed search.
+   *   2. If we have anything to select, fire a synthetic `stateLoaded.DT`
+   *      event with `{ columnControl: { 2: { searchList: [...] } } }`.
+   *      The searchList init wires a `stateLoaded` listener that calls
+   *      `checkList.values(values)` + `applySearch(values)` — exactly the
+   *      sync we'd otherwise have to reach into private state to do. The
+   *      idx-2 key is the original column index (kind), which is stable
+   *      under colReorder because `getState()` uses `idxOriginal()`.
+   */
+  _applyKindFilterToColumn() {
+    const dt = this._dtApi;
+    if (!dt) return;
+    const kindCol = dt.column('kind:name');
+    kindCol.columnControl.searchClear();
+    if (this._selectedKinds.size > 0) {
+      // `getState` inside the searchList listener reads the state by
+      // `idxOriginal()`. ColReorder reorders `aoColumns` in place,
+      // stamping `_crOriginalIdx` on each column to preserve the
+      // original position — that's the index we need here. (`column().index()`
+      // returns the *current* display index, which would be wrong after
+      // a reorder.) `colReorder.transpose(displayIdx, 'toOriginal')`
+      // is the supported way to convert.
+      const kindDisplay = kindCol.index();
+      const kindOriginal = dt.colReorder
+        ? dt.colReorder.transpose(kindDisplay, 'toOriginal')
+        : kindDisplay;
+      const state = {
+        columnControl: { [kindOriginal]: { searchList: Array.from(this._selectedKinds) } },
+      };
+      // dt.on('stateLoaded', …) auto-adds the `.dt` jQuery namespace
+      // (see datatables.net's _api_register for 'on()'), and it binds
+      // the listener to `this.tables().nodes()`. Trigger on the same
+      // jQuery set, namespace-less, so the searchList listener fires.
+      $(dt.tables().nodes()).trigger('stateLoaded', [dt.settings()[0], state]);
+    }
+    dt.draw();
+  }
 
   // ---- mutators ----------------------------------------------------------
 
@@ -295,6 +414,20 @@ export class RowTable {
         },
       },
       order: [[0, 'asc']],
+      // Per-column controls (DataTables ColumnControl): a sort toggle
+      // icon plus a search-dropdown that filters by substring on the
+      // column's displayed value. Column visibility is handled separately
+      // via the "columns…" picker (`_wireColumnsPicker`) so `colVis` is
+      // deliberately not in this list. The search content auto-detects
+      // the column type — for the time column we force `searchText`
+      // semantics below via `type: 'string'` so the user can type a
+      // partial UTC string ("2026-05-13", "08:03") and have it match
+      // by substring instead of the heavier datetime picker.
+      columnControl: ['order', 'searchDropdown'],
+      // Enables column reordering. We don't surface drag-to-reorder in
+      // the headers — the picker dialog calls `dt.colReorder.move()`.
+      // `enable: false` so the drag UI is dormant; the API still works.
+      colReorder: { enable: false },
       columns: this._buildColumns(),
       createdRow: (tr, rowData) => {
         tr.dataset.serial = rowData.actor_serial;
@@ -325,10 +458,21 @@ export class RowTable {
     const t = this._t.bind(this);
     return [
       {
-        // 0: serial — sortable, default sort
+        // 0: serial — sortable, default sort. Uses the plain-textbox
+        // search content (no operator <select>); operators like "Greater
+        // than" / "Equals" don't carry their weight for a short integer
+        // identifier — users just want to type a number / digits and
+        // have rows that contain them surface.
         title: t('ui.tableHeader.serial'),
         data:  'actor_serial',
         type:  'num',
+        columnControl: [
+          'order',
+          {
+            extend: 'dropdown', icon: 'search',
+            content: [{ extend: 'searchPlain', placeholder: 'serial #' }],
+          },
+        ],
         render: (data) => escapeText(data),
       },
       {
@@ -345,10 +489,27 @@ export class RowTable {
         },
       },
       {
-        // 2: kind pill
+        // 2: kind pill. Search here is a check-list of the distinct
+        // `_kind` values present in the table (replaces the old
+        // free-standing "all kinds / system / player / …" dropdown that
+        // used to live in the controls bar). The dropdown auto-populates
+        // from row data via `settings.fastData(row, idx, 'display')` —
+        // which is the rendered pill HTML — so each checkbox label
+        // renders as its pill. `name: 'kind'` lets the summary-pill
+        // wiring (`_applyKindFilterToColumn`) and the searchList refresh
+        // address this column by name, surviving column reorders without
+        // chasing a moving display index.
+        name:  'kind',
         title: t('ui.tableHeader.kind'),
         data:  '_kind',
         orderable: false,
+        columnControl: [
+          'order',
+          {
+            extend: 'dropdown', icon: 'search',
+            content: [{ extend: 'searchList' }],
+          },
+        ],
         render: (data) => {
           const label = t('ui.kind.' + data, { default: data });
           return `<span class="pill ${escapeAttr(data)}">${escapeText(label)}</span>`;
@@ -381,10 +542,12 @@ export class RowTable {
         },
       },
       {
-        // 5: owner
+        // 5: owner — hidden by default; users can toggle it back on via
+        // the per-column dropdown menu's "Column visibility" sub-list.
         title: t('ui.tableHeader.owner'),
         data:  'actor_owner',
         orderable: false,
+        visible:   false,
         className: 'muted',
         render: (data, type) => {
           if (type !== 'display') return data || '';
@@ -404,11 +567,25 @@ export class RowTable {
         },
       },
       {
-        // 7: time
+        // 7: time — UTC. We force `type: 'string'` so the ColumnControl
+        // `searchDropdown` falls through to a plain text input (matches
+        // by substring on the rendered "2026-05-13 04:56:15" form)
+        // rather than the heavier datetime picker that the auto-detector
+        // would otherwise pick. Per-column override sets a placeholder
+        // that calls out the UTC interpretation so users know what they
+        // are typing against.
         title: t('ui.tableHeader.time'),
         data:  'actor_time',
+        type:  'string',
         orderable: false,
         className: 'muted',
+        columnControl: [
+          'order',
+          {
+            extend: 'searchDropdown',
+            placeholder: 'YYYY-MM-DD HH:MM (UTC)',
+          },
+        ],
         render: (data) => escapeText(data || ''),
       },
     ];
@@ -439,8 +616,6 @@ export class RowTable {
         return false;
       }
       const q = (this._queryStr || '').toLowerCase();
-      const k = this._kindStr || '';
-      if (k && rowData._kind !== k) return false;
       if (this._anchor) {
         if (rowData._spatialDist == null) return false;
         if (rowData._spatialDist > this._anchor.rangeMeters) return false;
@@ -462,6 +637,14 @@ export class RowTable {
     this._dtApi.clear();
     this._dtApi.rows.add(this._allRows);
     this._dtApi.draw(preservePaging);
+    // The ColumnControl `searchList` on the kind column derives its
+    // check-list options from row data. It refreshes itself on `xhr`
+    // events (AJAX-driven tables); ours isn't AJAX, so when the row
+    // set changes we have to nudge it manually. Wrapped in try/catch
+    // because the method is only defined once the column header /
+    // content has been rendered — early enough by the first draw, but
+    // safer to be defensive.
+    try { this._dtApi.column('kind:name').columnControl.searchList('refresh'); } catch { /* noop */ }
   }
 
   _renderFilterCount() {
@@ -479,11 +662,9 @@ export class RowTable {
 
   _wireControls() {
     const searchEl = document.getElementById('search');
-    const kindEl   = document.getElementById('kindFilter');
     const anchorBtn = document.getElementById('anchorAtBtn');
 
     this._queryStr = '';
-    this._kindStr  = '';
 
     if (searchEl) {
       this._queryStr = searchEl.value.trim();
@@ -492,16 +673,176 @@ export class RowTable {
         this._dtApi?.draw();
       }, 200));
     }
-    if (kindEl) {
-      this._kindStr = kindEl.value;
-      kindEl.addEventListener('change', () => {
-        this._kindStr = kindEl.value;
-        this._dtApi?.draw();
-      });
-    }
     if (anchorBtn) {
       anchorBtn.addEventListener('click', () => this.setCustomAnchor());
     }
+
+    this._wireColumnsPicker();
+  }
+
+  /**
+   * Oracle APEX-style "Select columns" picker. Two stacked lists (hidden
+   * and displayed), left/right arrows toggle visibility, up/down arrows
+   * reorder within the displayed list via `dt.colReorder.move()`.
+   *
+   * The picker's lists are rebuilt every time the dialog opens. Selection
+   * is tracked locally on the list elements as a `.selected` class.
+   *
+   * `dist` (column 1) is excluded — its visibility is anchor-controlled
+   * (see `_applyAnchorChange`) and a user toggle would fight that logic.
+   */
+  _wireColumnsPicker() {
+    const btn        = document.getElementById('columnsBtn');
+    const dlg        = document.getElementById('columnsDialog');
+    const closeBtn   = document.getElementById('columnsDialogClose');
+    const resetBtn   = document.getElementById('columnsDialogReset');
+    const hiddenList    = document.getElementById('cpHiddenList');
+    const displayedList = document.getElementById('cpDisplayedList');
+    const moveRight = document.getElementById('cpMoveRight');
+    const moveLeft  = document.getElementById('cpMoveLeft');
+    const moveUp    = document.getElementById('cpMoveUp');
+    const moveDown  = document.getElementById('cpMoveDown');
+    if (!btn || !dlg) return;
+
+    const EXCLUDE_ORIGINAL_IDX = new Set([1]);   // dist — anchor-managed
+
+    // Original-index → title map, captured once from the column config so
+    // the list labels stay stable even if a future caller mutates titles.
+    const titleByOriginalIdx = new Map();
+    this._dtApi.columns({ order: 'original' }).every(function () {
+      titleByOriginalIdx.set(this.index(), this.title());
+    });
+
+    // Build the two lists from current DT state. We walk
+    // `colReorder.order()` which is [originalIdx-at-display-0, ...] so
+    // display order is preserved for the right pane. Hidden columns end
+    // up in whatever display position they last held — which is fine
+    // because they'll only ever reappear at that slot.
+    const rebuild = () => {
+      hiddenList.innerHTML = '';
+      displayedList.innerHTML = '';
+      const order = this._dtApi.colReorder.order();   // displayPos → originalIdx
+      for (const originalIdx of order) {
+        if (EXCLUDE_ORIGINAL_IDX.has(originalIdx)) continue;
+        const visible = this._dtApi.column(originalIdx, { order: 'original' }).visible();
+        const li = document.createElement('li');
+        li.className = 'cp-item';
+        li.dataset.originalIdx = String(originalIdx);
+        li.textContent = titleByOriginalIdx.get(originalIdx) || '?';
+        (visible ? displayedList : hiddenList).appendChild(li);
+      }
+      updateButtons();
+    };
+
+    const selectedItem = (listEl) => listEl.querySelector('.cp-item.selected');
+    const updateButtons = () => {
+      const sH = selectedItem(hiddenList);
+      const sD = selectedItem(displayedList);
+      moveRight.disabled = !sH;
+      moveLeft.disabled  = !sD || displayedList.children.length <= 1;
+      moveUp.disabled    = !sD || sD === displayedList.firstElementChild;
+      moveDown.disabled  = !sD || sD === displayedList.lastElementChild;
+    };
+
+    const clearSelection = (listEl) => {
+      const cur = selectedItem(listEl);
+      if (cur) cur.classList.remove('selected');
+    };
+
+    // Delegated click → single-select within a list. Selecting in one
+    // list clears selection in the other so the move buttons reflect a
+    // single active item across both panes.
+    const wireListSelection = (listEl, otherListEl) => {
+      listEl.addEventListener('click', (e) => {
+        const item = e.target.closest('.cp-item');
+        if (!item) return;
+        clearSelection(listEl);
+        clearSelection(otherListEl);
+        item.classList.add('selected');
+        updateButtons();
+      });
+    };
+    wireListSelection(hiddenList, displayedList);
+    wireListSelection(displayedList, hiddenList);
+
+    const dt = this._dtApi;
+
+    // Current display-position of a column given its original index.
+    const displayPosOf = (originalIdx) => {
+      const order = dt.colReorder.order();
+      return order.indexOf(originalIdx);
+    };
+
+    moveRight.addEventListener('click', () => {
+      const sel = selectedItem(hiddenList);
+      if (!sel) return;
+      const origIdx = Number(sel.dataset.originalIdx);
+      dt.column(origIdx, { order: 'original' }).visible(true);
+      rebuild();
+      const newSel = displayedList.querySelector(`[data-original-idx="${origIdx}"]`);
+      if (newSel) { newSel.classList.add('selected'); updateButtons(); }
+    });
+
+    moveLeft.addEventListener('click', () => {
+      const sel = selectedItem(displayedList);
+      if (!sel) return;
+      const origIdx = Number(sel.dataset.originalIdx);
+      dt.column(origIdx, { order: 'original' }).visible(false);
+      rebuild();
+      const newSel = hiddenList.querySelector(`[data-original-idx="${origIdx}"]`);
+      if (newSel) { newSel.classList.add('selected'); updateButtons(); }
+    });
+
+    // Move up/down operate on the displayed list. Skip over any
+    // currently-hidden column between the selected and its neighbour so
+    // the user-visible order matches the picker's order.
+    const moveBy = (dir /* -1 = up, +1 = down */) => {
+      const sel = selectedItem(displayedList);
+      if (!sel) return;
+      const origIdx = Number(sel.dataset.originalIdx);
+      const curPos  = displayPosOf(origIdx);
+      const order   = dt.colReorder.order();
+      // Walk away from curPos in `dir` direction until we find a visible
+      // (and not-excluded) column. That's the target display position.
+      let target = curPos + dir;
+      while (target >= 0 && target < order.length) {
+        const neighbourOrig = order[target];
+        if (!EXCLUDE_ORIGINAL_IDX.has(neighbourOrig)
+            && dt.column(neighbourOrig, { order: 'original' }).visible()) {
+          break;
+        }
+        target += dir;
+      }
+      if (target < 0 || target >= order.length) return;
+      dt.colReorder.move(curPos, target);
+      rebuild();
+      const newSel = displayedList.querySelector(`[data-original-idx="${origIdx}"]`);
+      if (newSel) { newSel.classList.add('selected'); updateButtons(); }
+    };
+    moveUp.addEventListener('click',   () => moveBy(-1));
+    moveDown.addEventListener('click', () => moveBy(+1));
+
+    resetBtn.addEventListener('click', () => {
+      // Restore original order, then re-apply the built-in default
+      // visibility (owner hidden; dist anchor-controlled, untouched here).
+      dt.colReorder.reset();
+      const cfg = this._buildColumns();
+      cfg.forEach((c, i) => {
+        if (i === 1) return;   // dist — leave anchor logic alone
+        const want = c.visible !== false;
+        if (dt.column(i, { order: 'original' }).visible() !== want) {
+          dt.column(i, { order: 'original' }).visible(want);
+        }
+      });
+      rebuild();
+    });
+
+    btn.addEventListener('click', () => {
+      rebuild();
+      if (typeof dlg.showModal === 'function') dlg.showModal();
+      else dlg.setAttribute('open', '');
+    });
+    closeBtn.addEventListener('click', () => dlg.close());
   }
 
   /**
@@ -629,6 +970,7 @@ export class RowTable {
         this._selectedSerial   = null;
         this._anchor           = null;
         this._relationshipFilter = null;
+        this._selectedKinds.clear();
         this._stampAllDistances();
         this._renderAnchorChip();
         this._renderRelationshipChip();
@@ -653,6 +995,7 @@ export class RowTable {
       this._selectedSerial   = null;
       this._anchor           = null;
       this._relationshipFilter = null;
+      this._selectedKinds.clear();
       this._renderAnchorChip();
       this._renderRelationshipChip();
       this._reloadDtData({ preservePaging: false });

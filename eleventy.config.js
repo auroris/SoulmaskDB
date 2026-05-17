@@ -36,6 +36,18 @@ export default function(eleventyConfig) {
       'lib/datatables.net-dt/dataTables.dataTables.mjs',
     'node_modules/datatables.net-dt/css/dataTables.dataTables.css':
       'lib/datatables.net-dt/dataTables.dataTables.css',
+    'node_modules/datatables.net-columncontrol/js/dataTables.columnControl.mjs':
+      'lib/datatables.net-columncontrol/dataTables.columnControl.mjs',
+    'node_modules/datatables.net-columncontrol-dt/js/columnControl.dataTables.mjs':
+      'lib/datatables.net-columncontrol-dt/columnControl.dataTables.mjs',
+    'node_modules/datatables.net-columncontrol-dt/css/columnControl.dataTables.css':
+      'lib/datatables.net-columncontrol-dt/columnControl.dataTables.css',
+    'node_modules/datatables.net-colreorder/js/dataTables.colReorder.mjs':
+      'lib/datatables.net-colreorder/dataTables.colReorder.mjs',
+    'node_modules/datatables.net-colreorder-dt/js/colReorder.dataTables.mjs':
+      'lib/datatables.net-colreorder-dt/colReorder.dataTables.mjs',
+    'node_modules/datatables.net-colreorder-dt/css/colReorder.dataTables.css':
+      'lib/datatables.net-colreorder-dt/colReorder.dataTables.css',
     'node_modules/flexsearch/dist/flexsearch.bundle.module.min.mjs':
       'lib/flexsearch/flexsearch.module.mjs',
   });
