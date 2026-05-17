@@ -1,4 +1,3 @@
-'use strict';
 /**
  * Eleventy build config.
  *
@@ -10,7 +9,7 @@
  *
  * Output: _site/ (gitignored).
  */
-module.exports = function(eleventyConfig) {
+export default function(eleventyConfig) {
   eleventyConfig.addPassthroughCopy('js');
   eleventyConfig.addPassthroughCopy('lib');
   eleventyConfig.addPassthroughCopy('functions');
@@ -21,6 +20,24 @@ module.exports = function(eleventyConfig) {
   // explicitly into lib/lz4-wasm/ alongside the adapter.
   eleventyConfig.addPassthroughCopy({
     'node_modules/lz4-wasm/lz4_wasm_bg.wasm': 'lib/lz4-wasm/lz4_wasm_bg.wasm',
+  });
+
+  // jQuery + DataTables + FlexSearch. The page loads the ESM builds via an
+  // import map in index.html (`jquery`, `datatables.net`, `datatables.net-dt`,
+  // `flexsearch`). Copy just the entry .mjs / .css files we actually
+  // reference — no bundling, the browser resolves the bare specifiers
+  // through the map.
+  eleventyConfig.addPassthroughCopy({
+    'node_modules/jquery/dist-module/jquery.module.js':
+      'lib/jquery/jquery.module.js',
+    'node_modules/datatables.net/js/dataTables.mjs':
+      'lib/datatables.net/dataTables.mjs',
+    'node_modules/datatables.net-dt/js/dataTables.dataTables.mjs':
+      'lib/datatables.net-dt/dataTables.dataTables.mjs',
+    'node_modules/datatables.net-dt/css/dataTables.dataTables.css':
+      'lib/datatables.net-dt/dataTables.dataTables.css',
+    'node_modules/flexsearch/dist/flexsearch.bundle.module.min.mjs':
+      'lib/flexsearch/flexsearch.module.mjs',
   });
 
   return {

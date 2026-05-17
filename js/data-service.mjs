@@ -30,14 +30,14 @@
  *   'file-removed'   { id }
  */
 
+import { fmtBytes } from './util.mjs';
+
 const DB_NAME_EXT = /\.(db|sqlite|db3)$/i;
 
 export class DataService {
-  constructor({ sqliteService, orchestrator }) {
-    if (!sqliteService) throw new Error('DataService: sqliteService is required');
-    if (!orchestrator)  throw new Error('DataService: orchestrator is required');
-    this._sqlite = sqliteService;
-    this._orch   = orchestrator;
+  constructor() {
+    this._sqlite    = null;
+    this._orch      = null;
 
     this._files     = [];
     this._activeId  = null;
@@ -51,9 +51,20 @@ export class DataService {
     this._initialized  = false;
   }
 
-  /** Bind drag/drop on window and wire up the dialog DOM. Idempotent. */
-  init() {
+  /**
+   * Receive dependencies, bind drag/drop on window, and wire up the
+   * dialog DOM. Idempotent. Called by Orchestrator.init().
+   *
+   * @param {object} deps
+   * @param {SqliteService} deps.sqlite       used to peek/close the active DB
+   * @param {Orchestrator}  deps.orchestrator used to trigger file loads
+   */
+  async init({ sqlite, orchestrator } = {}) {
     if (this._initialized) return;
+    if (!sqlite)       throw new Error('DataService.init: sqlite is required');
+    if (!orchestrator) throw new Error('DataService.init: orchestrator is required');
+    this._sqlite = sqlite;
+    this._orch   = orchestrator;
     this._initialized = true;
     this._bindDragDrop();
     this._wireDialog();
@@ -381,12 +392,4 @@ function hasFiles(e) {
   if (!t) return false;
   if (t.types && Array.from(t.types).includes('Files')) return true;
   return !!(t.files && t.files.length);
-}
-
-function fmtBytes(n) {
-  if (!Number.isFinite(n) || n <= 0) return '0 B';
-  const units = ['B','KB','MB','GB','TB'];
-  let i = 0, v = n;
-  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-  return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`;
 }

@@ -1,24 +1,38 @@
 /**
- * Orchestrator — composes SqliteService, WorkerService, SearchService
- * and owns the file-load lifecycle.
+ * Orchestrator — composition root and file-load lifecycle.
  *
- * Today's flow:
- *   1. User picks a file → app.js hands the bytes to `orchestrator.loadFile`.
- *   2. Orchestrator opens the DB via SqliteService (any prior handle goes
- *      stale and throws on use).
- *   3. Orchestrator validates `actor_table` exists. Bails with a
- *      'load-error' event otherwise.
- *   4. Orchestrator queries all rows, runs classify, builds the per-row
- *      summary list, and emits 'rows-ready' so the UI can render
- *      immediately (without blob-text matches).
- *   5. Orchestrator clears the search index, then kicks
- *      WorkerService.decode(blobItems) — fire-and-let-it-stream.
- *   6. A persistent subscription (set up in the constructor) forwards
- *      worker `batch` events to SearchService.absorbBatch as they land,
- *      filtered by per-load callId so a second loadFile-while-A-still-
- *      decoding correctly abandons A's leftover batches.
- *   7. When the worker's decode promise resolves, orchestrator emits
- *      'file-loaded' and the UI flips out of its loading state.
+ * Owns two distinct concerns:
+ *
+ *   1. Boot (one-shot, via `init()`):
+ *      a. Promise.all on the two async wasm boots (lz4 + sqlite3). Doing
+ *         them in parallel halves the wall-clock for cold-start.
+ *      b. Bind the lz4 backend into blob.mjs (`bindLz4`) so the main
+ *         thread's codec pipeline can call lz4Decompress/lz4Compress.
+ *         (Each worker does the same inside its own context.)
+ *      c. Init the other modules in dependency order, threading the
+ *         resources each one needs into its init():
+ *            data.init({ sqlite, orchestrator })
+ *            rowTable.init({ orchestrator, search, dataService,
+ *                            classify, steam, i18n })
+ *      d. Wire FactExtractor → SearchService forwarding so per-batch
+ *         blob manifests stream into the search index as they land.
+ *
+ *   2. File-load lifecycle (per-call, via `loadFile()`):
+ *      1. User picks a file → DataService hands the bytes to `loadFile`.
+ *      2. Open the DB via SqliteService (any prior handle goes stale
+ *         and throws on use).
+ *      3. Validate `actor_table` exists. Bail with 'load-error' otherwise.
+ *      4. Query all rows, run classify, build per-row summaries, emit
+ *         'rows-ready' so the UI can render immediately (without
+ *         blob-text matches).
+ *      5. Clear the search index, then kick FactExtractor.decode for
+ *         all blob bytes — fire-and-let-it-stream.
+ *      6. The forwarding subscription installed in step 1d feeds each
+ *         worker `batch` event into SearchService, filtered by per-load
+ *         callId so a second loadFile-while-A-still-decoding correctly
+ *         abandons A's leftover batches.
+ *      7. When the decode promise resolves, emit 'file-loaded' and the
+ *         UI flips out of its loading state.
  *
  * Events (addListener):
  *   'rows-ready'  { rows, handle, serverId, label }
@@ -41,29 +55,83 @@
  *   as a third belt-and-braces layer.
  */
 
+import { bindLz4 } from '../lib/unreal/blob.mjs';
+
 export class Orchestrator {
-  constructor({ sqliteService, workerService, searchService, classify }) {
-    if (!sqliteService)  throw new Error('Orchestrator: sqliteService is required');
-    if (!workerService)  throw new Error('Orchestrator: workerService is required');
-    if (!searchService)  throw new Error('Orchestrator: searchService is required');
+  constructor({
+    // wasm services (init() runs in Promise.all)
+    lz4, sqlite,
+    // parallel decode + search/data/table
+    factExtractor, search, data, rowTable,
+    // utility modules with no async init, threaded into sub-module init
+    classify, steam, i18n,
+  }) {
+    if (!lz4)            throw new Error('Orchestrator: lz4 is required');
+    if (!sqlite)         throw new Error('Orchestrator: sqlite is required');
+    if (!factExtractor)  throw new Error('Orchestrator: factExtractor is required');
+    if (!search)         throw new Error('Orchestrator: search is required');
+    if (!data)           throw new Error('Orchestrator: data is required');
+    if (!rowTable)       throw new Error('Orchestrator: rowTable is required');
     if (!classify)       throw new Error('Orchestrator: classify is required');
-    this._sqlite    = sqliteService;
-    this._worker    = workerService;
-    this._search    = searchService;
-    this._classify  = classify;
+    if (!steam)          throw new Error('Orchestrator: steam is required');
+    if (!i18n)           throw new Error('Orchestrator: i18n is required');
+
+    this._lz4            = lz4;
+    this._sqlite         = sqlite;
+    this._factExtractor  = factExtractor;
+    this._search         = search;
+    this._data           = data;
+    this._rowTable       = rowTable;
+    this._classify       = classify;
+    this._steam          = steam;
+    this._i18n           = i18n;
 
     this._listeners = new Set();
     this._loadId    = 0;
     this._currentFileLabel = null;
 
-    // Per-load state used by the worker→search forwarding listener
-    // installed below. `_activeTag` matches the tag attached to events
-    // from the current load's worker.decode() call; absorbBatch is
-    // short-circuited on tag mismatch so leftover batches from an
-    // abandoned load can't pollute the new search index.
+    // Per-load state used by the fact-extractor→search forwarding listener
+    // installed in init(). `_activeTag` matches the tag attached to events
+    // from the current load's decode() call; absorbBatch is short-circuited
+    // on tag mismatch so leftover batches from an abandoned load can't
+    // pollute the new search index.
     this._activeTag    = null;
     this._activeEpoch  = 0;
-    this._installWorkerForwarding();
+    this._initialized  = false;
+  }
+
+  /**
+   * Boot. Idempotent. Must be awaited before any loadFile() call.
+   *   Step 1: lz4 + sqlite wasm in parallel (Promise.all).
+   *   Step 2: bind lz4 backend into blob.mjs on this thread.
+   *   Step 3: init the other modules with the resources they need.
+   *   Step 4: hook fact-extractor batch events into the search index.
+   */
+  async init() {
+    if (this._initialized) return;
+    this._initialized = true;
+
+    // 1+2: wasm boots run in parallel; the rest waits on both.
+    await Promise.all([this._lz4.init(), this._sqlite.init()]);
+    bindLz4(this._lz4);
+
+    // 3: init the other modules in dependency order. Each receives only
+    // the resources it actually consumes — no kitchen-sink dep bags.
+    await this._data.init({
+      sqlite:       this._sqlite,
+      orchestrator: this,
+    });
+    await this._rowTable.init({
+      orchestrator: this,
+      search:       this._search,
+      dataService:  this._data,
+      classify:     this._classify,
+      steam:        this._steam,
+      i18n:         this._i18n,
+    });
+
+    // 4: stream fact-extractor batches into the search index.
+    this._installFactForwarding();
   }
 
   addListener(fn) {
@@ -82,12 +150,12 @@ export class Orchestrator {
   db() { return this._sqlite.current(); }
 
   /**
-   * Wire WorkerService events into SearchService. Installed once at
-   * construction. Each loadFile() updates `_activeTag` so this listener
+   * Wire FactExtractor events into SearchService. Installed once during
+   * init(). Each loadFile() updates `_activeTag` so this listener
    * forwards only batches from the active decode pass.
    */
-  _installWorkerForwarding() {
-    this._worker.addListener((event, data) => {
+  _installFactForwarding() {
+    this._factExtractor.addListener((event, data) => {
       if (!data) return;
       if (this._activeTag == null || data.tag !== this._activeTag) return;
       if (event === 'batch') {
@@ -164,18 +232,18 @@ export class Orchestrator {
       // Announce the metadata. UI renders immediately on this event.
       this._emit('rows-ready', { rows, handle, serverId, label });
 
-      // Tag this load's worker.decode call with `myLoadId` and update
-      // the forwarding subscription's filter. The subscription was
-      // installed once at construction time and matches on `data.tag`,
-      // so anything currently in flight from an older load (different
-      // tag) is automatically dropped.
+      // Tag this load's decode call with `myLoadId` and update the
+      // forwarding subscription's filter. The subscription was installed
+      // once during init() and matches on `data.tag`, so anything
+      // currently in flight from an older load (different tag) is
+      // automatically dropped.
       this._activeEpoch = epoch;
       this._activeTag   = myLoadId;
 
       try {
-        await this._worker.decode(indexItems, { tag: myLoadId });
+        await this._factExtractor.decode(indexItems, { tag: myLoadId });
       } catch {
-        // 'load-error' already emitted by the worker-forwarding listener.
+        // 'load-error' already emitted by the fact-forwarding listener.
         return;
       }
       if (myLoadId !== this._loadId) return;
@@ -229,13 +297,6 @@ export class Orchestrator {
     row.actor_data = null;
     return row;
   }
-
-  /**
-   * Re-classify ONLY (no blob re-decode). Slightly cheaper than
-   * reindexRow for cases where we know the blob bytes haven't changed,
-   * but currently unused — the edit callsites can't always tell whether
-   * the blob changed, so they default to the safer reindexRow path.
-   */
 
   _detectServerId(handle) {
     // world.db: server_id comes from GAME_SETTINGS. accounts.db has no

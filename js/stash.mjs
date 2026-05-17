@@ -1,4 +1,3 @@
-'use strict';
 /**
  * Row stash — in-memory clipboard for whole actor_table rows.
  *
@@ -35,9 +34,7 @@
  *   - server_id:    a destination-specific value. The caller is responsible
  *     for binding the destination DB's server_id when pasting.
  */
-window.SMDB = window.SMDB || {};
-
-SMDB.stash = (() => {
+export const stash = (() => {
   const FILE_FORMAT = 'soulmaskdb-stash';
   const FILE_VERSION = 1;
 

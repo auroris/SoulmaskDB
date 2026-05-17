@@ -1,17 +1,15 @@
-'use strict';
 /**
  * English catalog. Keys are namespaced:
  *   ui.*    — UI strings we author. Add new keys here as the UI grows.
  *   gloss.* — game-vocab Pinyin → English mapping consumed by
- *             SMDB.classify.translateIdent. Missing keys fall back to the
+ *             classify.translateIdent. Missing keys fall back to the
  *             raw token; add new ones when you see an unmapped class name
  *             in the wild.
  *
  * Interpolation uses {placeholders}. Numbers are typically pre-formatted
  * via toLocaleString() at the call site.
  */
-window.SMDB_LOCALES = window.SMDB_LOCALES || {};
-window.SMDB_LOCALES.en = {
+export const en = {
   '_displayName':                   'English',
 
   // ------------------------------------------------------------- page chrome
@@ -199,6 +197,7 @@ window.SMDB_LOCALES.en = {
   'ui.tree.setItems':               '{{count} items}',
   'ui.tree.entries':                '{{count} entries}',
   'ui.tree.sizeMismatchTitle':      'reader and tag.Size disagree',
+  'ui.tree.showMore':               '… show {count} more',
 
   // ------------------------------------------------------------- stash dialog
   'ui.stash.heading':               'Row stash',

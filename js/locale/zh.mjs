@@ -1,4 +1,3 @@
-'use strict';
 /**
  * Chinese (simplified) catalog. Starter content — translations are
  * best-effort and should be reviewed by a native speaker. Missing keys
@@ -10,8 +9,7 @@
  * Tokens not listed below — including English ones like "Conveyor",
  * "NPC", "Monster" — fall back to the raw token, which is fine.
  */
-window.SMDB_LOCALES = window.SMDB_LOCALES || {};
-window.SMDB_LOCALES.zh = {
+export const zh = {
   '_displayName':                   '中文',
 
   // ------------------------------------------------------------- page chrome

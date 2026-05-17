@@ -17,6 +17,15 @@ import { createRequire } from 'node:module';
 
 import { codecs } from './js/codecs.mjs';
 import { DecodePool } from './lib/workers/pool.mjs';
+import { Lz4Service } from './lib/lz4-wasm/lz4-service.mjs';
+import { bindLz4 } from './lib/unreal/blob.mjs';
+
+// blob.mjs no longer auto-boots an lz4 backend on import — bind one for
+// the main-thread serial pass below. (The DecodePool's workers each boot
+// their own lz4 instance inside decode-worker.mjs.)
+const _lz4 = new Lz4Service();
+await _lz4.init();
+bindLz4(_lz4);
 
 const require = createRequire(import.meta.url);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));

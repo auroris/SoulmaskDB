@@ -13,7 +13,8 @@
  *
  * Lifecycle:
  *   const sqlite = new SqliteService();
- *   const db = await sqlite.open(bytes);     // sqlite3 WASM boots lazily here
+ *   await sqlite.init();                     // boots the sqlite3 WASM up front
+ *   const db = await sqlite.open(bytes);     // open() also boots lazily if init() was skipped
  *   db.exec(...) / db.selectValue(...) / db.export() / …
  *   const db2 = await sqlite.open(otherBytes);   // closes `db`; `db.exec` now throws
  *
@@ -64,10 +65,13 @@ export class SqliteService {
   }
 
   /**
-   * Lazy WASM boot. Repeated callers share the same promise so we only
-   * pay the init cost once per page.
+   * Boot the sqlite3 WASM module. Idempotent — repeated callers share
+   * the same promise. The orchestrator calls this up front (alongside
+   * the lz4 wasm boot) so the first open() doesn't pay the latency.
+   * open()/peek() still call it as a safety net for callers that bypass
+   * the orchestrator (e.g. node tests).
    */
-  async _ensureBooted() {
+  async init() {
     if (this._sqlite3) return this._sqlite3;
     if (this._initPromise) return this._initPromise;
     if (typeof this._init !== 'function') {
@@ -86,7 +90,7 @@ export class SqliteService {
    * followed by 'opened' for the new one.
    */
   async open(bytes) {
-    const sqlite3 = await this._ensureBooted();
+    const sqlite3 = await this.init();
 
     if (this._currentHandle) {
       const prior = this._currentHandle;
@@ -131,7 +135,7 @@ export class SqliteService {
    * Concurrent callers chain in FIFO order via `_peekChain`.
    */
   async peek(bytes, fn) {
-    const sqlite3 = await this._ensureBooted();
+    const sqlite3 = await this.init();
     const prev = this._peekChain;
     let release;
     this._peekChain = new Promise(r => { release = r; });

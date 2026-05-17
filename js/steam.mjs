@@ -1,4 +1,3 @@
-'use strict';
 /**
  * Steam ID utilities.
  *
@@ -27,9 +26,7 @@
  *
  * Display precedence: label > personaName > bare steam64.
  */
-window.SMDB = window.SMDB || {};
-
-SMDB.steam = (() => {
+export const steam = (() => {
   // Public universe, type Individual, instance 1: 0x0110000100000000.
   const STEAM_BASE = 76561197960265728n;
   const ACCOUNT_TYPE_INDIVIDUAL = 1;

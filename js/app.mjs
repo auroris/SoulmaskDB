@@ -9,30 +9,15 @@
  * single source of truth for what to render in each language.
  */
 
+import { escapeText, escapeAttr, fmtBytes } from './util.mjs';
+import { renderPropertyTree } from './property-tree.mjs';
+
 // ============================================================
 // SHARED RENDER HELPERS
 // ============================================================
 
 const $ = id => document.getElementById(id);
 const t = SMDB.i18n.t;  // file-scope alias for terse call sites
-
-function escapeText(s) {
-  return String(s ?? '').replace(/[&<>"']/g, c =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-}
-const escapeAttr = escapeText;
-
-function debounce(fn, ms) {
-  let t;
-  return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
-}
-
-function fmtBytes(n) {
-  if (!n) return '0 B';
-  if (n < 1024) return n + ' B';
-  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-  return (n / 1024 / 1024).toFixed(1) + ' MB';
-}
 
 function hexDump(blob, start = 0, maxBytes = 4096) {
   const end = Math.min(blob.length, start + maxBytes);
@@ -55,147 +40,95 @@ function hexDump(blob, start = 0, maxBytes = 4096) {
 }
 
 // ============================================================
-// UI STATE + ORCHESTRATOR
+// UI STATE + ORCHESTRATOR + ROW TABLE
 // ============================================================
 
-// The orchestrator owns the file-load lifecycle (sqlite init, blob
-// indexing, server-id detection). app.js keeps the UI-side canonical row
-// list and per-page render state — those move with the UI component
-// refactor, not this one.
-let allRows = [];
-let filtered = [];
-let currentPage = 0;
-const PAGE_SIZE = 200;
-let selectedSerial = null;
+// DB-level state that doesn't belong to RowTable:
+//   - dirty            tracks unsaved edits to the SQLite handle
+//   - currentFileLabel / currentServerId  used by the paste-from-stash
+//     flow so inserted rows belong to *this* DB. RowTable also tracks
+//     these but the locals avoid threading the dependency everywhere.
 let dirty = false;
 let currentFileLabel = null;
-// server_id detected from the loaded DB. Used when pasting from stash so
-// inserted rows belong to this server, not whichever server the stash was
-// captured from. Set on the orchestrator's 'rows-ready' event.
-let currentServerId = null;
-// Spatial anchor — when set, applyFilters keeps only rows whose transform
-// is within rangeMeters of pos and sorts ascending by distance. Rows
-// without a parseable transform drop out while anchored. Cleared on DB
-// (re)load because positions are world-specific.
-let spatialAnchor = null;  // { serial, label, pos, rangeMeters }
+let currentServerId  = null;
 
 const setStatus = msg => { $('status').textContent = msg || ''; };
 
-// Construct the orchestrator and the data service at module-load.
-// bootstrap.mjs has finished its TLA chain by now AND all classic defer
-// scripts (classify, i18n, steam, stash, partials, locale/*) have
-// completed, so SMDB.classify is populated. Constructing here (rather
-// than earlier in bootstrap.mjs) avoids a cache-warm race where the lz4
-// wasm TLA resolves before the defer queue advances.
-SMDB.orchestrator = new SMDB.Orchestrator({
-  sqliteService: SMDB.sqliteService,
-  workerService: SMDB.workerService,
-  searchService: SMDB.search,
-  classify:      SMDB.classify,
-});
-SMDB.data = new SMDB.DataService({
-  sqliteService: SMDB.sqliteService,
-  orchestrator:  SMDB.orchestrator,
-});
-SMDB.data.init();
+// bootstrap.mjs constructed every service, awaited orchestrator.init()
+// (which booted the lz4 + sqlite3 wasm in parallel, then inited DataService
+// and RowTable with their dependencies), and dynamically imported this
+// module. So by the time we run, SMDB.orchestrator / SMDB.data /
+// SMDB.rowTable are fully wired and we only need to attach UI listeners.
+const rowTable = SMDB.rowTable;
 
 // Shorthand for the rest of this file. Always returns the *current*
 // handle (or null), so callers automatically see the new DB after a
 // fresh load and stale handles never linger.
 const getDb = () => SMDB.orchestrator.db();
 
-// Wire the orchestrator's file-load events to the UI. 'rows-ready'
-// happens BEFORE blob decoding finishes — that's the point of the
-// non-blocking design — so the table renders immediately on SQL columns
-// and the SearchService listener (set up in the wire-up section
-// below) re-applies the filter as decode batches stream in.
+// Surface load errors as alerts. RowTable handles the rows-ready /
+// unloaded paths (it owns the table); we only react to errors here.
 SMDB.orchestrator.addListener((event, data) => {
-  if (event === 'rows-ready') {
-    allRows         = data.rows;
-    currentServerId = data.serverId;
-    currentFileLabel = data.label;
-    dirty           = false;
-    selectedSerial  = null;
-    spatialAnchor   = null;
-    renderAnchorChip();
-    $('detail').classList.add('hidden');
-    $('main').classList.remove('with-detail');
-    updateChrome();
-    applyFilters();
-    setStatus(t('ui.status.loaded',
-      { file: data.label, count: data.rows.length.toLocaleString() }));
-    resolvePlayerNames();
-  } else if (event === 'load-error') {
+  if (event === 'load-error') {
     setStatus('');
     alert(t('ui.alert.notSoulmaskDB', { file: data.label }));
   }
 });
 
-// SMDB.data (DataService) owns the file-upload lifecycle: drag-drop,
-// validation, the file list dialog, and the trigger that calls into
-// orchestrator.loadFile when the user clicks Switch To. This module just
-// subscribes to the orchestrator's 'rows-ready' / 'load-error' events
-// (set up above) and the data service's 'unloaded' event (set up below).
-
-// When the active DB is removed via the data dialog, clear UI state and
-// reopen the dialog so the user can pick another file.
+// When the active DB is removed, hand the dialog back to the user.
 SMDB.data.addListener((event /*, data */) => {
   if (event !== 'unloaded') return;
-  allRows = [];
-  filtered = [];
-  currentServerId = null;
-  currentFileLabel = null;
-  dirty = false;
-  selectedSerial = null;
-  spatialAnchor = null;
-  renderAnchorChip();
-  $('detail').classList.add('hidden');
-  $('main').classList.remove('with-detail');
-  updateChrome();
-  applyFilters();
   setStatus('');
   SMDB.data.maybeAutoOpen();
 });
 
+// RowTable funnels every load + every per-row mutation through
+// 'rows-replaced', so this is the single place we refresh chrome /
+// status / detail panel.
+rowTable.addListener((event, data) => {
+  if (event === 'rows-replaced') {
+    currentFileLabel = data.label;
+    currentServerId  = data.serverId;
+    dirty = false;
+    $('detail').classList.add('hidden');
+    $('main').classList.remove('with-detail');
+    updateChrome();
+    if (data.label) {
+      setStatus(t('ui.status.loaded',
+        { file: data.label, count: data.rows.length.toLocaleString() }));
+      resolvePlayerNames(data.rows);
+    }
+  } else if (event === 'row-selected') {
+    renderDetailFor(data.serial);
+  } else if (event === 'row-deselected') {
+    $('detail').classList.add('hidden');
+    $('main').classList.remove('with-detail');
+  }
+});
+
 // Fire-and-forget Steam-name resolution after a save loads. On success,
 // re-renders the table so resolved names appear in the row list. Errors
-// (404, CORS, offline, etc.) are silently swallowed by SMDB.steam.resolveNames
-// — the existing manual-label flow remains the fallback.
-function resolvePlayerNames() {
+// (404, CORS, offline, etc.) are silently swallowed by SMDB.steam.resolveNames.
+function resolvePlayerNames(rows) {
   const ids = [];
-  for (const r of allRows) {
+  for (const r of rows) {
     if (SMDB.steam.isSteamId64(r.actor_name)) ids.push(r.actor_name);
   }
   if (ids.length === 0) return;
   SMDB.steam.resolveNames(ids).then(updated => {
-    if (updated > 0) { renderTable(); updateChrome(); }
+    if (updated > 0) { rowTable.redraw(); updateChrome(); }
   });
 }
 
 /**
  * Re-index a single row after a SQL/blob edit (or remove it after a
- * delete) AND keep `allRows` in sync with what the orchestrator/search
- * service see. The orchestrator handles the DB read + search-index
- * update; app.js owns `allRows` until the UI refactor moves that.
+ * delete). Orchestrator updates the DB read + search-index; RowTable
+ * keeps the visible table in sync via upsert/remove.
  */
 function reindexRow(serial) {
   const newRow = SMDB.orchestrator.reindexRow(serial);
-  if (!newRow) {
-    // Deleted at the DB layer — drop from local state too.
-    allRows = allRows.filter(r => r.actor_serial !== serial);
-    return;
-  }
-  const idx = allRows.findIndex(r => r.actor_serial === serial);
-  if (idx >= 0) {
-    allRows[idx] = newRow;
-  } else {
-    // New row (stash paste) — insert at the right serial-sorted position.
-    let insertAt = allRows.length;
-    for (let i = 0; i < allRows.length; i++) {
-      if (allRows[i].actor_serial > serial) { insertAt = i; break; }
-    }
-    allRows.splice(insertAt, 0, newRow);
-  }
+  if (!newRow) rowTable.removeRow(serial);
+  else rowTable.upsertRow(newRow);
 }
 
 function getRowDetail(serial) {
@@ -215,247 +148,31 @@ function markDirty() { dirty = true; updateChrome(); }
 
 function updateChrome() {
   const db = getDb();
-  $('downloadBtn').disabled = !db;
   $('verifyAllBtn').disabled = !db;
   $('scriptsBtn').disabled = !db;
   $('controls').hidden = !db;
   $('empty').hidden = !!db;
   $('changedBadge').textContent = dirty ? t('ui.header.changedBadge') : '';
   $('stashBtn').textContent = t('ui.header.stash', { count: SMDB.stash.count() });
-  const cacheN = SMDB.steam.cacheCount();
-  $('steamCacheBtn').textContent = t('ui.header.steamCache', { count: cacheN });
-  $('steamCacheBtn').disabled = cacheN === 0;
   if (db) renderSummary();
 }
 
 // ============================================================
-// TABLE / FILTERS / SUMMARY
+// SUMMARY (RowTable owns the table itself)
 // ============================================================
 
-function applyFilters() {
-  const q = $('search').value.toLowerCase().trim();
-  const k = $('kindFilter').value;
-  filtered = allRows.filter(r => {
-    if (k && r._kind !== k) return false;
-    if (!q) return true;
-    if (String(r.actor_serial) === q) return true;
-    // SQL-column matches are always available. The blob-text match goes
-    // through SMDB.search, which returns false for rows that haven't
-    // been indexed yet — those rows simply won't blob-match until their
-    // batch lands. SearchService fires a re-render via its listener.
-    return (r.actor_script || '').toLowerCase().includes(q)
-        || (r.actor_name   || '').toLowerCase().includes(q)
-        || (r.actor_owner  || '').toLowerCase().includes(q)
-        || (r._summary     || '').toLowerCase().includes(q)
-        || SMDB.search.matches(r.actor_serial, q);
-  });
-  applySpatialAnchor();
-  currentPage = 0;
-  renderTable();
-}
-
-// When an anchor is set, mutate `filtered` to keep only rows with a
-// parseable transform within rangeMeters of the anchor, sorted ascending
-// by distance. Stamps `_spatialDist` (meters) on surviving rows so the
-// table render can show a distance column without recomputing. Clears
-// stale `_spatialDist` from any row that survived the previous anchor
-// but no longer applies.
-function applySpatialAnchor() {
-  if (!spatialAnchor) {
-    for (const r of allRows) r._spatialDist = undefined;
-    return;
-  }
-  const range = spatialAnchor.rangeMeters;
-  const withinRange = [];
-  for (const r of allRows) r._spatialDist = undefined;
-  for (const r of filtered) {
-    const tx = SMDB.classify.parseTransform(r.actor_transf);
-    if (!tx) continue;
-    const d = SMDB.classify.distanceMeters(tx, spatialAnchor.pos);
-    if (d == null || d > range) continue;
-    r._spatialDist = d;
-    withinRange.push(r);
-  }
-  withinRange.sort((a, b) => a._spatialDist - b._spatialDist);
-  filtered = withinRange;
-}
-
-function renderTable() {
-  const start = currentPage * PAGE_SIZE;
-  const slice = filtered.slice(start, start + PAGE_SIZE);
-  const thead = $('rowsTable').querySelector('thead');
-  const tbody = $('rowsTable').querySelector('tbody');
-
-  const anchored = !!spatialAnchor;
-  const distHeader = anchored ? `<th>${escapeText(t('ui.tableHeader.distance'))}</th>` : '';
-
-  thead.innerHTML = `
-    <tr>
-      <th>${escapeText(t('ui.tableHeader.serial'))}</th>
-      ${distHeader}
-      <th>${escapeText(t('ui.tableHeader.kind'))}</th>
-      <th>${escapeText(t('ui.tableHeader.class'))}</th>
-      <th>${escapeText(t('ui.tableHeader.summary'))}</th>
-      <th>${escapeText(t('ui.tableHeader.owner'))}</th>
-      <th>${escapeText(t('ui.tableHeader.blob'))}</th>
-      <th>${escapeText(t('ui.tableHeader.time'))}</th>
-    </tr>`;
-
-  if (slice.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="${anchored ? 8 : 7}" class="muted" style="padding: 16px;">${escapeText(t('ui.tableEmpty'))}</td></tr>`;
-  } else {
-    tbody.innerHTML = slice.map(r => {
-      const nameLabel = SMDB.steam.isSteamId64(r.actor_name) ? steamShortLabel(r.actor_name) : '';
-      const labelHtml = nameLabel
-        ? `${escapeText(r._label)} <span class="muted">— ${escapeText(nameLabel)}</span>`
-        : escapeText(r._label);
-      const distCell = anchored
-        ? `<td class="muted">${r._spatialDist != null ? r._spatialDist.toFixed(1) + ' m' : ''}</td>`
-        : '';
-      return `
-      <tr data-serial="${r.actor_serial}" class="${r.actor_serial === selectedSerial ? 'selected' : ''}">
-        <td>${r.actor_serial}</td>
-        ${distCell}
-        <td><span class="pill ${r._kind}">${escapeText(t('ui.kind.' + r._kind, {default: r._kind}))}</span></td>
-        <td title="${escapeAttr(r.actor_script || '')}">${labelHtml}</td>
-        <td title="${escapeAttr(r._summary || '')}">${escapeText(r._summary)}</td>
-        <td class="muted" title="${escapeAttr(r.actor_owner || '')}">${escapeText(r.actor_owner || '')}</td>
-        <td class="muted">${fmtBytes(r.blob_size || 0)}</td>
-        <td class="muted">${escapeText(r.actor_time || '')}</td>
-      </tr>`;
-    }).join('');
-  }
-
-  tbody.querySelectorAll('tr[data-serial]').forEach(tr => {
-    tr.addEventListener('click', () => selectRow(parseInt(tr.dataset.serial, 10)));
-  });
-
-  $('filterCount').textContent = t('ui.filterCount', {
-    shown: filtered.length.toLocaleString(),
-    total: allRows.length.toLocaleString(),
-  });
-
-  renderPagination();
-}
-
-function renderPagination() {
-  const total = filtered.length;
-  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  if (total === 0) { $('pagination').hidden = true; return; }
-  $('pagination').hidden = false;
-  $('pagination').innerHTML = `
-    <button id="firstPage" ${currentPage === 0 ? 'disabled' : ''}>${escapeText(t('ui.pagination.first'))}</button>
-    <button id="prevPage"  ${currentPage === 0 ? 'disabled' : ''}>${escapeText(t('ui.pagination.prev'))}</button>
-    <span class="muted">${escapeText(t('ui.pagination.pageOf', { page: currentPage + 1, pages }))}</span>
-    <button id="nextPage"  ${currentPage >= pages - 1 ? 'disabled' : ''}>${escapeText(t('ui.pagination.next'))}</button>
-    <button id="lastPage"  ${currentPage >= pages - 1 ? 'disabled' : ''}>${escapeText(t('ui.pagination.last'))}</button>
-  `;
-  $('firstPage')?.addEventListener('click', () => { currentPage = 0; renderTable(); });
-  $('prevPage') ?.addEventListener('click', () => { currentPage--;   renderTable(); });
-  $('nextPage') ?.addEventListener('click', () => { currentPage++;   renderTable(); });
-  $('lastPage') ?.addEventListener('click', () => { currentPage = pages - 1; renderTable(); });
-}
-
 function renderSummary() {
+  const rows = rowTable.rows();
   const counts = {};
-  for (const r of allRows) counts[r._kind] = (counts[r._kind] || 0) + 1;
+  for (const r of rows) counts[r._kind] = (counts[r._kind] || 0) + 1;
   const order = ['system', 'player', 'inventory', 'npc', 'animal', 'container', 'station', 'building', 'furniture', 'vegetation', 'region', 'vehicle', 'other'];
   $('summary').innerHTML = `
-    <div class="stat"><span class="muted">${escapeText(t('ui.summary.total'))}</span><b>${allRows.length.toLocaleString()}</b></div>
+    <div class="stat"><span class="muted">${escapeText(t('ui.summary.total'))}</span><b>${rows.length.toLocaleString()}</b></div>
     ${order.filter(k => counts[k]).map(k => `
       <div class="stat"><span class="pill ${k}">${escapeText(t('ui.kind.' + k, {default: k}))}</span><b>${counts[k].toLocaleString()}</b></div>
     `).join('')}
   `;
   $('summary').hidden = false;
-}
-
-function steamShortLabel(steamid64) {
-  return SMDB.steam.displayName(steamid64) || '';
-}
-
-// Toggle the anchor chip in #controls. When `spatialAnchor` is non-null,
-// shows a label + editable x/y/z position inputs + range (meters) + clear.
-// Editing position decouples the anchor from its source row (clears
-// .serial) so the row's "⚓ anchored" indicator reverts. Position/range
-// edits debounce into applyFilters.
-function renderAnchorChip() {
-  const chip = $('anchorChip');
-  if (!chip) return;
-  if (!spatialAnchor) {
-    chip.classList.add('hidden');
-    chip.innerHTML = '';
-    return;
-  }
-  chip.classList.remove('hidden');
-  const labelText = spatialAnchor.serial != null
-    ? t('ui.anchor.label', { serial: spatialAnchor.serial, label: spatialAnchor.label })
-    : t('ui.anchor.customLabel');
-  chip.innerHTML = `
-    <span class="anchor-label">${escapeText(labelText)}</span>
-    <label>x <input id="anchorPosX" type="number" step="any" value="${spatialAnchor.pos[0]}" style="width:80px;"></label>
-    <label>y <input id="anchorPosY" type="number" step="any" value="${spatialAnchor.pos[1]}" style="width:80px;"></label>
-    <label>z <input id="anchorPosZ" type="number" step="any" value="${spatialAnchor.pos[2]}" style="width:80px;"></label>
-    <label>${escapeText(t('ui.anchor.range'))}
-      <input id="anchorRange" type="number" min="0" step="10" value="${spatialAnchor.rangeMeters}" style="width:70px;"> m
-    </label>
-    <button id="anchorClear" title="${escapeAttr(t('ui.anchor.clear'))}">×</button>
-  `;
-  const onPosInput = debounce(() => {
-    const x = Number($('anchorPosX').value);
-    const y = Number($('anchorPosY').value);
-    const z = Number($('anchorPosZ').value);
-    if (![x, y, z].every(Number.isFinite)) return;
-    spatialAnchor.pos = [x, y, z];
-    // Editing pos decouples from the source row.
-    if (spatialAnchor.serial != null) {
-      spatialAnchor.serial = null;
-      spatialAnchor.label = t('ui.anchor.customLabel');
-      const lbl = $('anchorChip').querySelector('.anchor-label');
-      if (lbl) lbl.textContent = spatialAnchor.label;
-      if (selectedSerial != null) selectRow(selectedSerial);
-    }
-    applyFilters();
-  }, 250);
-  $('anchorPosX').addEventListener('input', onPosInput);
-  $('anchorPosY').addEventListener('input', onPosInput);
-  $('anchorPosZ').addEventListener('input', onPosInput);
-  $('anchorRange').addEventListener('input', debounce(() => {
-    const v = Number($('anchorRange').value);
-    if (Number.isFinite(v) && v >= 0) {
-      spatialAnchor.rangeMeters = v;
-      applyFilters();
-    }
-  }, 150));
-  $('anchorClear').addEventListener('click', () => {
-    const wasSerial = spatialAnchor.serial;
-    spatialAnchor = null;
-    renderAnchorChip();
-    applyFilters();
-    // If the previously-anchored row is currently open in the detail
-    // panel, re-render it so the anchor button label flips back.
-    if (selectedSerial === wasSerial) selectRow(selectedSerial);
-  });
-}
-
-// Create a custom (no-source-row) anchor at the origin so the user can
-// type coords into the chip. If an anchor already exists, leave its pos
-// alone and just focus the X input — letting the user re-target the
-// existing anchor's location is the more common case.
-function openCustomAnchor() {
-  if (!spatialAnchor) {
-    spatialAnchor = {
-      serial: null,
-      label: t('ui.anchor.customLabel'),
-      pos: [0, 0, 0],
-      rangeMeters: 100,
-    };
-    renderAnchorChip();
-    applyFilters();
-  }
-  setTimeout(() => {
-    const el = $('anchorPosX');
-    if (el) { el.focus(); el.select(); }
-  }, 0);
 }
 
 // ============================================================
@@ -467,13 +184,19 @@ const NUMERIC_FIELDS = new Set(['server_id', 'data_version']);
 const FIELD_HINTS = { actor_time: 'UTC' };
 
 function selectRow(serial) {
-  selectedSerial = serial;
+  // Thin wrapper. RowTable.setSelection emits 'row-selected', and the
+  // listener installed at module load calls renderDetailFor(serial).
+  rowTable.setSelection(serial);
+}
+
+function renderDetailFor(serial) {
   const row = getRowDetail(serial);
-  const summary = allRows.find(r => r.actor_serial === serial);
+  if (!row) return;
+  const summary = rowTable.findRow(serial);
+  if (!summary) return;
   renderDetail(row, summary);
   $('main').classList.add('with-detail');
   $('detail').classList.remove('hidden');
-  renderTable();
 }
 
 function renderDetail(row, summary) {
@@ -562,40 +285,32 @@ function defaultFieldInput(row, f) {
 }
 
 // Build the context object passed to every partial's render/wire phase.
-// Closes over the current row, summary, decoded blob, and the module-local
-// state partials might need to read or mutate (spatialAnchor, Steam labels).
-// Exposed-on-ctx helpers keep partial files independent of app.js internals.
+// Closes over the current row, summary, decoded blob, and the rowTable
+// state partials need to read or mutate (spatial anchor, Steam labels).
+// Exposed-on-ctx helpers keep partial files independent of app.mjs and
+// of RowTable internals.
 function buildPartialCtx(row, summary, decoded) {
   return {
     row, summary, decoded,
     t,
     escapeText, escapeAttr,
     fieldId: name => `f_${name}`,
-    // Look up another row by serial (returns the lightweight `allRows`
-    // entry — no blob — or null). Partials that need the raw blob should
-    // call ctx.lookupRowDetail(serial) instead.
-    lookupRow(serial) {
-      return allRows.find(r => r.actor_serial === serial) || null;
-    },
+    // Look up another row by serial (returns the lightweight row entry
+    // — no blob — or null). Partials that need the raw blob should call
+    // ctx.lookupRowDetail(serial) instead.
+    lookupRow(serial) { return rowTable.findRow(serial); },
     lookupRowDetail: getRowDetail,
-    allRowsIter() { return allRows; },
+    allRowsIter() { return rowTable.rows(); },
     navigate(serial) {
-      const target = allRows.find(r => r.actor_serial === serial);
-      if (target) selectRow(serial);
+      if (rowTable.findRow(serial)) selectRow(serial);
     },
     spatial: {
-      get isAnchored() { return !!spatialAnchor && spatialAnchor.serial === row.actor_serial; },
+      get isAnchored() { return rowTable.isAnchoredOn(row.actor_serial); },
       setRowAsAnchor() {
-        const tx2 = SMDB.classify.parseTransform(row.actor_transf);
-        if (!tx2) { alert(t('ui.alert.anchorNoTransform')); return; }
-        spatialAnchor = {
-          serial: row.actor_serial,
-          label:  summary._label || ('#' + row.actor_serial),
-          pos:    tx2.pos,
-          rangeMeters: spatialAnchor ? spatialAnchor.rangeMeters : 100,
-        };
-        renderAnchorChip();
-        applyFilters();
+        if (!rowTable.setRowAsAnchor(row)) {
+          alert(t('ui.alert.anchorNoTransform'));
+          return;
+        }
         selectRow(row.actor_serial);
       },
     },
@@ -603,7 +318,8 @@ function buildPartialCtx(row, summary, decoded) {
       saveLabel(value) {
         SMDB.steam.setLabel(row.actor_name, value);
         setStatus(t('ui.status.savedPersona', { id: row.actor_name }));
-        reindexRow(row.actor_serial); applyFilters(); selectRow(row.actor_serial);
+        reindexRow(row.actor_serial);
+        selectRow(row.actor_serial);
       },
     },
   };
@@ -612,7 +328,7 @@ function buildPartialCtx(row, summary, decoded) {
 function renderBlobByCodec(decoded, serial) {
   if (!decoded) return `<div class="muted">${escapeText(t('ui.detail.noBlob'))}</div>`;
   if (decoded.kind === 'json-wrapped')      return renderJsonBlob(decoded, serial);
-  if (decoded.kind === 'unreal-properties') return renderUnrealProperties(decoded);
+  if (decoded.kind === 'unreal-properties') return renderPropertyTree(decoded);
   // Unknown / empty: show the first bytes inline since there's no
   // structured view to render in their place.
   if (decoded._raw) {
@@ -640,221 +356,6 @@ function renderJsonBlob(decoded, serial) {
       <button id="revertJsonBlob" disabled>${escapeText(t('ui.blob.revertJson'))}</button>
       <span class="muted" id="jsonStatus"></span>
     </div>`;
-}
-
-function renderUnrealProperties(decoded) {
-  const errorBanner = decoded.error
-    ? `<div class="danger" style="margin-bottom:8px;">${escapeText(t('ui.blob.parseError', { message: decoded.error }))}</div>`
-    : '';
-
-  const trailing = decoded.bodyTrailing && decoded.bodyTrailing.length > 0
-    ? `<div class="muted" style="margin-bottom:8px;">${decoded.bodyTrailing.length} bytes trailing after None terminator</div>`
-    : '';
-
-  const props = decoded.properties || [];
-  const propsHeading = `<div class="prop-tree-heading muted">${escapeText(t('ui.blob.properties', { count: props.length }))}</div>`;
-  const treeHtml = props.length === 0
-    ? `<div class="muted">${escapeText(t('ui.tree.empty'))}</div>`
-    : `<div class="prop-tree">${props.map((p, i) => renderPropertyEntry(p, i, 0)).join('')}</div>`;
-
-  return `
-    ${errorBanner}
-    ${trailing}
-    ${propsHeading}
-    ${treeHtml}
-  `;
-}
-
-// ---- structured-tree rendering -----------------------------------------
-//
-// Value renderers all return `{ inline, children }`:
-//   inline   HTML fragment shown after the property name on the same row
-//   children HTML fragment (one row per child) shown indented below, or
-//            '' for leaf values.
-//
-// renderPropertyEntry decides on markup: leaf rows are plain <div>s,
-// rows with children become <details><summary>row</summary>…</details>.
-// The native <details> toggle gives expand/collapse for free; CSS in
-// index.html turns the default marker into a chevron and hides it for
-// leaves so the name column aligns across both shapes.
-
-function renderPropertyEntry(prop, idx, depth) {
-  // Local var name MUST NOT be `t` — that's the file-scope i18n alias and
-  // the size-mismatch branch below needs it. (renderValue() solves the
-  // same shadowing problem by using `propType`.)
-  const tag = prop.tag;
-  const typeStr = propertyTypeLabel(tag);
-  const nameStr = formatFName(tag.name) + (tag.arrayIndex ? `[${tag.arrayIndex}]` : '');
-  const { inline, children } = renderValue(tag, prop.value, depth);
-  const sizeWarn = prop._sizeMismatch
-    ? ` <span class="danger" title="${escapeAttr(t('ui.tree.sizeMismatchTitle'))}">⚠</span>`
-    : '';
-  const guidLine = tag.hasPropertyGuid ? ` <span class="muted">{${tag.propertyGuid}}</span>` : '';
-  const head = `<span class="prop-chevron"></span><span class="prop-name">${escapeText(nameStr)}</span><span class="prop-type muted">: ${escapeText(typeStr)}${guidLine}${sizeWarn}</span><span class="prop-val">${inline}</span>`;
-  const pad = `padding-left:${depth * 14}px;`;
-  if (children) {
-    return `<details class="prop-node" open><summary class="prop-row" style="${pad}">${head}</summary><div class="prop-children">${children}</div></details>`;
-  }
-  return `<div class="prop-row" style="${pad}">${head}</div>`;
-}
-
-// Synthetic row for array indices, set members, and map keys: same markup
-// as renderPropertyEntry but no type/guid/size columns. Takes a fully
-// pre-rendered name string and the same {inline, children} pair.
-function renderSyntheticRow(nameHtml, inline, children, depth) {
-  const head = `<span class="prop-chevron"></span><span class="prop-name">${nameHtml}</span><span class="prop-val">${inline}</span>`;
-  const pad = `padding-left:${depth * 14}px;`;
-  if (children) {
-    return `<details class="prop-node" open><summary class="prop-row" style="${pad}">${head}</summary><div class="prop-children">${children}</div></details>`;
-  }
-  return `<div class="prop-row" style="${pad}">${head}</div>`;
-}
-
-function propertyTypeLabel(tag) {
-  let t = tag.type.value;
-  if (t === 'StructProperty') return `StructProperty (${tag.structName.value})`;
-  if (t === 'ArrayProperty')  return `ArrayProperty&lt;${tag.innerType.value}&gt;`;
-  if (t === 'SetProperty')    return `SetProperty&lt;${tag.innerType.value}&gt;`;
-  if (t === 'MapProperty')    return `MapProperty&lt;${tag.innerType.value}, ${tag.valueType.value}&gt;`;
-  if (t === 'ByteProperty' && tag.enumName?.value && tag.enumName.value !== 'None') return `ByteProperty (${tag.enumName.value})`;
-  if (t === 'EnumProperty')   return `EnumProperty (${tag.enumName.value})`;
-  return t;
-}
-
-function formatFName(n) {
-  if (!n) return '';
-  if (typeof n === 'string') return n;
-  return n.number ? `${n.value}_${n.number - 1}` : n.value;
-}
-
-// Helper for leaf returns to keep the call sites short.
-const leaf = inline => ({ inline, children: '' });
-
-function renderValue(tag, value, depth) {
-  const propType = tag.type.value;  // local var (shadows file-scope `t` i18n alias)
-  if (value && value._opaque) {
-    return leaf(`<span class="muted">${escapeText(SMDB.i18n.t('ui.tree.opaque', { bytes: value._opaque.length, reason: value._opaqueReason || '?' }))}</span>`);
-  }
-  switch (propType) {
-    case 'IntProperty': case 'Int8Property': case 'Int16Property':
-    case 'UInt16Property': case 'UInt32Property':
-      return leaf(`= <code>${value}</code>`);
-    case 'Int64Property': case 'UInt64Property':
-      return leaf(`= <code>${escapeText(String(value))}</code>`);
-    case 'FloatProperty': case 'DoubleProperty':
-      return leaf(`= <code>${Number(value).toPrecision(7)}</code>`);
-    case 'BoolProperty':
-      return leaf(`= <code>${value}</code>`);
-    case 'StrProperty':
-      return leaf(`= <code>${escapeText(JSON.stringify(value))}</code>`);
-    case 'NameProperty':
-      return leaf(`= <code>${escapeText(formatFName(value))}</code>`);
-    case 'ObjectProperty': case 'ClassProperty':
-    case 'WeakObjectProperty': case 'LazyObjectProperty':
-    case 'WSObjectProperty': {
-      // Plain string = just a path; object = path + embedded property stream
-      // (Soulmask serializes the referenced object's data inline).
-      if (typeof value === 'string') return leaf(`→ <code>${escapeText(value)}</code>`);
-      const pathHtml = `→ <code>${escapeText(value.path)}</code>`;
-      if (!value.embedded || value.embedded.length === 0) return leaf(pathHtml);
-      const inner = value.embedded.map((p, i) => renderPropertyEntry(p, i, depth + 1)).join('');
-      return { inline: pathHtml, children: inner };
-    }
-    case 'SoftObjectProperty': case 'SoftClassProperty':
-      return leaf(`→ <code>${escapeText(value.assetPath)}${value.subPath ? ':' + escapeText(value.subPath) : ''}</code>`);
-    case 'ByteProperty':
-      return leaf(tag.enumName.value === 'None'
-        ? `= <code>${value}</code>`
-        : `= <code>${escapeText(formatFName(value))}</code>`);
-    case 'EnumProperty':
-      return leaf(`= <code>${escapeText(formatFName(value))}</code>`);
-    case 'StructProperty':
-      return renderStructValue(value, depth);
-    case 'ArrayProperty':
-      return renderArrayValue(tag, value, depth);
-    case 'SetProperty':
-      return renderSetValue(tag, value, depth);
-    case 'MapProperty':
-      return renderMapValue(tag, value, depth);
-    case 'TextProperty':
-      return leaf(`<span class="muted">${escapeText(SMDB.i18n.t('ui.tree.text', { bytes: value && value._opaque ? value._opaque.length : 0 }))}</span>`);
-    default:
-      return leaf(`<span class="muted">${escapeText(SMDB.i18n.t('ui.tree.value', { type: propType }))}</span>`);
-  }
-}
-
-function renderStructValue(sv, depth) {
-  if (!sv) return leaf(`<span class="muted">${escapeText(t('ui.tree.emptyStruct'))}</span>`);
-  const name = sv._structName;
-  // Known-binary struct: render compactly.
-  if (SMDB.unreal.STRUCT_HANDLERS[name]) {
-    return leaf(`= <code>${escapeText(JSON.stringify(sv.value))}</code>`);
-  }
-  if (sv._structDecodeError) {
-    return leaf(`<span class="danger">${escapeText(t('ui.tree.structDecodeError', { message: sv._structDecodeError }))}</span>`);
-  }
-  if (!Array.isArray(sv.value) || sv.value.length === 0) {
-    return leaf(`<span class="muted">${escapeText(t('ui.tree.empty'))}</span>`);
-  }
-  const inner = sv.value.map((p, i) => renderPropertyEntry(p, i, depth + 1)).join('');
-  return { inline: '', children: inner };
-}
-
-function renderArrayValue(tag, value, depth) {
-  if (!value || !value.elements || value.elements.length === 0) {
-    return leaf(`<span class="muted">[]</span>`);
-  }
-  const innerType = tag.innerType.value;
-  // Show inline if elements are tiny primitives and the array is small.
-  const isShortPrim = value.elements.length <= 8 && ['IntProperty','FloatProperty','BoolProperty','NameProperty','StrProperty'].includes(innerType);
-  if (isShortPrim) {
-    return leaf(`= <code>${escapeText(JSON.stringify(value.elements.map(stringifyForInline)))}</code>`);
-  }
-  const items = value.elements.map((e, i) => {
-    if (innerType === 'StructProperty') {
-      const { inline, children } = renderStructValue(e, depth + 1);
-      return renderSyntheticRow(`[${i}]`, inline, children, depth + 1);
-    }
-    return renderSyntheticRow(`[${i}]`, `= <code>${escapeText(stringifyForInline(e))}</code>`, '', depth + 1);
-  }).join('');
-  return {
-    inline: `<span class="muted">${escapeText(t('ui.tree.items', { count: value.elements.length }))}</span>`,
-    children: items,
-  };
-}
-
-function renderSetValue(tag, value, depth) {
-  const elements = value.elements || [];
-  const items = elements.map((e, i) =>
-    renderSyntheticRow(`{${i}}`, `= <code>${escapeText(stringifyForInline(e))}</code>`, '', depth + 1)
-  ).join('');
-  return {
-    inline: `<span class="muted">${escapeText(t('ui.tree.setItems', { count: elements.length }))}</span>`,
-    children: items,
-  };
-}
-
-function renderMapValue(tag, value, depth) {
-  const entries = value.entries || [];
-  const items = entries.map((e, i) => {
-    const keyHtml = `<code>${escapeText(stringifyForInline(e.key))}</code>`;
-    const valInline = ` → <code>${escapeText(stringifyForInline(e.value))}</code>`;
-    return renderSyntheticRow(keyHtml, valInline, '', depth + 1);
-  }).join('');
-  return {
-    inline: `<span class="muted">${escapeText(t('ui.tree.entries', { count: entries.length }))}</span>`,
-    children: items,
-  };
-}
-
-function stringifyForInline(v) {
-  if (v == null) return 'null';
-  if (typeof v === 'object') {
-    if (v._structName) return `${v._structName}(${JSON.stringify(v.value)})`;
-    if (v.value !== undefined && v.number !== undefined) return formatFName(v);
-    return JSON.stringify(v);
-  }
-  return String(v);
 }
 
 function wireDetailEditing(row, summary, decoded) {
@@ -914,7 +415,7 @@ function wireDetailEditing(row, summary, decoded) {
         bind: [...cols.map(c => updates[c]), row.actor_serial],
       });
     } catch (e) { alert(t('ui.alert.updateFailed', { message: e.message })); return; }
-    markDirty(); reindexRow(row.actor_serial); applyFilters(); selectRow(row.actor_serial);
+    markDirty(); reindexRow(row.actor_serial); selectRow(row.actor_serial);
   });
 
   // delete --------
@@ -924,10 +425,9 @@ function wireDetailEditing(row, summary, decoded) {
     try { getDb().exec({ sql: 'DELETE FROM actor_table WHERE actor_serial = ?', bind: [serialToRemove] }); }
     catch (e) { alert(t('ui.alert.deleteFailed', { message: e.message })); return; }
     markDirty();
-    selectedSerial = null;
-    $('detail').classList.add('hidden');
-    $('main').classList.remove('with-detail');
-    reindexRow(serialToRemove); applyFilters();
+    // reindexRow → rowTable.removeRow → clearSelection → emits 'row-deselected'
+    // → listener hides the detail panel. Nothing else to do here.
+    reindexRow(serialToRemove);
   });
 
   // stash --------
@@ -945,10 +445,7 @@ function wireDetailEditing(row, summary, decoded) {
   });
 
   $('closeDetail').addEventListener('click', () => {
-    selectedSerial = null;
-    $('detail').classList.add('hidden');
-    $('main').classList.remove('with-detail');
-    renderTable();
+    rowTable.clearSelection();
   });
 
   // The Transform anchor button and Steam persona-label inputs are wired
@@ -980,7 +477,7 @@ function wireDetailEditing(row, summary, decoded) {
       try {
         getDb().exec({ sql: 'UPDATE actor_table SET actor_data = ? WHERE actor_serial = ?', bind: [newBytes, row.actor_serial] });
       } catch (e) { alert(t('ui.alert.updateFailed', { message: e.message })); return; }
-      markDirty(); reindexRow(row.actor_serial); applyFilters(); selectRow(row.actor_serial);
+      markDirty(); reindexRow(row.actor_serial); selectRow(row.actor_serial);
     });
   }
 }
@@ -1152,7 +649,7 @@ async function pasteFromStash(id) {
           bind: [...cols.map(c => bindings[c]), existingSerial],
         });
       } catch (e) { alert(t('ui.alert.replaceFailed', { message: e.message })); return; }
-      markDirty(); reindexRow(existingSerial); applyFilters();
+      markDirty(); reindexRow(existingSerial);
       setStatus(t('ui.status.replacedFromStash', { serial: existingSerial, label: entry.label }));
       selectRow(existingSerial);
       $('stashDialog').close();
@@ -1172,7 +669,7 @@ async function pasteFromStash(id) {
     });
   } catch (e) { alert(t('ui.alert.insertFailed', { message: e.message })); return; }
   const newSerial = db.selectValue('SELECT last_insert_rowid()');
-  markDirty(); reindexRow(newSerial); applyFilters();
+  markDirty(); reindexRow(newSerial);
   const statusKey = existingSerial ? 'ui.status.pastedRenumbered' : 'ui.status.pastedAsNew';
   setStatus(t(statusKey, { label: entry.label, serial: newSerial, name: bindings.actor_name }));
   selectRow(newSerial);
@@ -1288,14 +785,14 @@ async function runVerifyAll() {
 let scriptsUnmappedOnly = false;
 
 function openScriptsDialog() {
-  if (!db) return;
+  if (!getDb()) return;
   scriptsUnmappedOnly = $('scriptsFilterUnmapped').checked;
   renderScriptsList();
   $('scriptsDialog').showModal();
 }
 
 function renderScriptsList() {
-  const all = SMDB.classify.aggregateScripts(allRows);
+  const all = SMDB.classify.aggregateScripts(rowTable.rows());
   const unmappedCount = all.filter(s => s.kind === 'other').length;
   const shown = (scriptsUnmappedOnly ? all.filter(s => s.kind === 'other') : all)
     .slice()
@@ -1334,7 +831,7 @@ function renderScriptsList() {
 }
 
 async function copyUnmappedScripts() {
-  const all = SMDB.classify.aggregateScripts(allRows);
+  const all = SMDB.classify.aggregateScripts(rowTable.rows());
   const unmapped = all.filter(s => s.kind === 'other').sort((a, b) => b.count - a.count);
   if (unmapped.length === 0) return;
   // Plain text, "<count>\t<script>" per line — readable and machine-parseable.
@@ -1349,50 +846,30 @@ async function copyUnmappedScripts() {
 }
 
 // ============================================================
-// DOWNLOAD
-// ============================================================
-
-function downloadDB() {
-  if (!getDb()) return;
-  setStatus(t('ui.status.serializing'));
-  const size = SMDB.data.downloadActive();
-  dirty = false;
-  updateChrome();
-  setStatus(t('ui.status.exported', { size: fmtBytes(size) }));
-}
-
-// ============================================================
 // WIRE-UP
 // ============================================================
 
-// File picking, drag-drop, validation, and Switch-To live in SMDB.data
-// (js/data-service.mjs). The header "files" button is wired by the data
-// service itself; here we only wire features that own UI outside the
-// data dialog.
-$('search').addEventListener('input', debounce(applyFilters, 200));
-$('kindFilter').addEventListener('change', applyFilters);
-$('downloadBtn').addEventListener('click', downloadDB);
+// File picking, drag-drop, validation, Switch-To, and Download all live
+// in SMDB.data (js/data-service.mjs). The header "files" button is wired
+// by the data service itself; downloads happen through that dialog. Here
+// we only wire features that own UI outside the data dialog and the
+// table.
+//
+// Search box, kind filter, anchor button, and the per-batch re-filter
+// are owned by RowTable (js/row-table.mjs). We only consume search
+// progress events for the status bar.
 
-// As the SearchService finishes batches, re-apply the filter so newly-
-// indexed rows pick up blob-text matches. Debounced so a burst of batch
-// completions during initial indexing doesn't thrash the table render.
-// The status bar shows progress so the user knows the index is filling.
-const _refilterOnIndex = debounce(() => { if (getDb()) applyFilters(); }, 150);
 SMDB.search.addListener((event, data) => {
   if (event === 'batch') {
-    _refilterOnIndex();
     if (data && data.total > 0) {
       setStatus(t('ui.status.indexingBlobs',
         { count: `${data.indexed.toLocaleString()} / ${data.total.toLocaleString()}` }));
     }
   } else if (event === 'done') {
-    _refilterOnIndex();
     if (currentFileLabel) {
       setStatus(t('ui.status.loaded',
-        { file: currentFileLabel, count: allRows.length.toLocaleString() }));
+        { file: currentFileLabel, count: rowTable.count().toLocaleString() }));
     }
-  } else if (event === 'reset') {
-    _refilterOnIndex();
   }
 });
 
@@ -1406,18 +883,6 @@ $('scriptsFilterUnmapped').addEventListener('change', () => {
   renderScriptsList();
 });
 $('scriptsCopyUnmapped').addEventListener('click', copyUnmappedScripts);
-
-$('steamCacheBtn').addEventListener('click', () => {
-  const n = SMDB.steam.cacheCount();
-  if (n === 0) return;
-  if (confirm(t('ui.alert.confirmClearSteam', { count: n }))) {
-    SMDB.steam.clearCache();
-    updateChrome();
-    if (getDb()) renderTable();
-  }
-});
-
-$('anchorAtBtn').addEventListener('click', openCustomAnchor);
 
 $('stashBtn').addEventListener('click', openStash);
 $('stashClose').addEventListener('click', () => $('stashDialog').close());
@@ -1496,8 +961,8 @@ SMDB.i18n.applyToDom();
   });
 })();
 
-// SqliteService boots its WASM module lazily on the first sqlite.open()
-// call (inside Orchestrator.loadFile), so there's no init-on-page-load
-// step here. The chrome is still updated once so the "Choose a file"
-// empty-state renders correctly.
+// Orchestrator.init() already booted the sqlite3 + lz4 wasm in parallel
+// before this module loaded, so there's no init-on-page-load step here.
+// The chrome is still updated once so the "Choose a file" empty-state
+// renders correctly.
 updateChrome();

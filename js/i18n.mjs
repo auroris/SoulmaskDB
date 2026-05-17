@@ -1,19 +1,8 @@
-'use strict';
 /**
  * Internationalization layer.
  *
- * Catalogs live on `window.SMDB_LOCALES`, populated by per-locale script
- * files that MUST load BEFORE this file:
- *
- *   <script src="js/locale/en.js"></script>
- *   <script src="js/locale/zh.js"></script>
- *   <script src="js/i18n.js"></script>
- *
- * Each locale script does:
- *   window.SMDB_LOCALES = window.SMDB_LOCALES || {};
- *   window.SMDB_LOCALES.en = { 'ui.button.save': 'Save', 'gloss.JianZhu': 'building', ... };
- *
- * Keys are namespaced:
+ * Catalogs come from per-locale ESM modules (./locale/en.mjs, zh.mjs,
+ * ...). Each catalog exports an object keyed by:
  *   ui.*    — strings we author. Missing key returns ⟨key⟩ sentinel and
  *             logs a warning so untranslated UI stands out.
  *   gloss.* — game vocabulary (open-ended). Missing key falls back silently
@@ -31,17 +20,18 @@
  *
  * Static HTML: elements with `data-i18n="key"` get their text content set;
  * `data-i18n-title` / `data-i18n-placeholder` set those attributes. Call
- * `SMDB.i18n.applyToDom()` after DOMContentLoaded.
+ * `i18n.applyToDom()` after DOMContentLoaded.
  *
  * Locale switching reloads the page with the new ?lang= so all the static
  * substitution and JS-side string captures pick up the new catalog.
  */
-window.SMDB = window.SMDB || {};
+import { en } from './locale/en.mjs';
+import { zh } from './locale/zh.mjs';
 
-SMDB.i18n = (() => {
+export const i18n = (() => {
   const LOCALE_KEY = 'soulmaskdb.locale.v1';
   const DEFAULT_LOCALE = 'en';
-  const locales = window.SMDB_LOCALES || {};
+  const locales = { en, zh };
 
   function detect() {
     const url = new URL(location.href);

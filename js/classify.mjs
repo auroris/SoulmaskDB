@@ -1,4 +1,3 @@
-'use strict';
 /**
  * Row classifier — maps a raw actor_table row to a (kind, label, summary)
  * triple, plus the small set of canonical strings other code uses to detect
@@ -9,7 +8,7 @@
  * before generic ones (e.g. 'jianzhu/rongqi' must come before bare
  * 'jianzhu'). To extend coverage, drop a new rule into the right slot and
  * (if introducing a brand-new kind) add ui.kind.* / ui.kindFilter.* entries
- * to js/locale/{en,zh}.js.
+ * to js/locale/{en,zh}.mjs.
  *
  * Rule shape:
  *   { name:           '...'              } — exact actor_name match
@@ -29,15 +28,13 @@
  *   label    short identifier for the "class" table column
  *   summary  localized descriptive text for the "summary" table column
  *
- * SMDB.classify.SCRIPT and SMDB.classify.NAME expose the canonical strings
+ * `classify.SCRIPT` and `classify.NAME` expose the canonical strings
  * (script paths, reserved actor_names) so callers that need to detect a
  * specific row shape don't have to restate them.
- *
- * Depends on SMDB.i18n being loaded first (load order in index.html).
  */
-window.SMDB = window.SMDB || {};
+import { i18n } from './i18n.mjs';
 
-SMDB.classify = (() => {
+export const classify = (() => {
   // Canonical script paths. Compare actor_script === SCRIPT.X to detect a
   // specific row kind structurally rather than guessing from substrings.
   const SCRIPT = Object.freeze({
@@ -147,7 +144,7 @@ SMDB.classify = (() => {
 
   function decomposeIdent(token) {
     if (!token) return '';
-    const tr = SMDB.i18n.t;
+    const tr = i18n.t;
     let v = tr('gloss.' + token, { default: null });
     if (v != null) return v;
     // Whole-token miss: look for the longest PascalCase prefix that has
@@ -192,7 +189,7 @@ SMDB.classify = (() => {
     const name   = (row && row.actor_name)   || '';
     const script = (row && row.actor_script) || '';
     const scriptLower = script.toLowerCase();
-    const t = SMDB.i18n.t;
+    const t = i18n.t;
 
     for (const rule of RULES) {
       if (!ruleMatches(rule, row || {}, scriptLower)) continue;
@@ -211,7 +208,7 @@ SMDB.classify = (() => {
     const tx = parseTransform(transf);
     const pos = tx ? ` @ ${tx.pos.map(n => Math.round(n)).join(',')}` : '';
     const bearing = tx ? bearingFromTransform(tx) : null;
-    const facing = bearing ? ' ' + SMDB.i18n.t('ui.compass.' + bearing, { default: bearing }) : '';
+    const facing = bearing ? ' ' + i18n.t('ui.compass.' + bearing, { default: bearing }) : '';
     return { kind, label: cls, summary: translateIdent(cls) + pos + facing };
   }
 

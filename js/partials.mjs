@@ -1,4 +1,3 @@
-'use strict';
 /**
  * Partials — composable field/section editors for the detail panel.
  *
@@ -38,7 +37,7 @@
  *
  * The render/wire ctx exposes:
  *   row, summary, decoded      Current row's data.
- *   t                          i18n alias (SMDB.i18n.t).
+ *   t                          i18n alias (i18n.t).
  *   fieldId(name)              DOM id for a field by name ('f_<name>').
  *   escapeText, escapeAttr     HTML escapers.
  *   spatial.isAnchored         Is the current row the spatial anchor?
@@ -46,14 +45,13 @@
  *   steam.saveLabel(value)     Persist a Steam persona label for this row.
  *
  * To add a new partial: write { type, name, appliesTo, ... } and call
- * SMDB.partials.register(it) from this file (or load order-after, before
- * app.js). The dispatcher picks it up on the next renderDetail().
- *
- * Depends on SMDB.classify and SMDB.steam being loaded first.
+ * `partials.register(it)` from this file (or any importer that runs
+ * before app.mjs). The dispatcher picks it up on the next renderDetail().
  */
-window.SMDB = window.SMDB || {};
+import { classify } from './classify.mjs';
+import { steam }    from './steam.mjs';
 
-SMDB.partials = (() => {
+export const partials = (() => {
   const FIELD_PARTIALS   = [];
   const SECTION_PARTIALS = [];
 
@@ -91,14 +89,14 @@ SMDB.partials = (() => {
     type: 'section',
     name: 'SteamProfile',
     slot: 'preFields',
-    appliesTo: (row) => !!row && SMDB.steam.isSteamId64(row.actor_name),
+    appliesTo: (row) => !!row && steam.isSteamId64(row.actor_name),
     render(ctx) {
       const { t, escapeText, escapeAttr } = ctx;
       const steamid64 = ctx.row.actor_name;
-      const s = SMDB.steam.decompose(steamid64);
+      const s = steam.decompose(steamid64);
       if (!s) return '';
-      const stored = SMDB.steam.getLabel(steamid64) || '';
-      const info = SMDB.steam.getInfo(steamid64);
+      const stored = steam.getLabel(steamid64) || '';
+      const info = steam.getInfo(steamid64);
       const placeholder = info && info.personaName
         ? t('ui.steam.placeholder.auto', { name: info.personaName })
         : t('ui.steam.placeholder.manual');
@@ -125,7 +123,7 @@ SMDB.partials = (() => {
       const labelEl = document.getElementById('steamLabel');
       const saveEl  = document.getElementById('saveSteamLabel');
       if (!labelEl || !saveEl) return;
-      const orig = SMDB.steam.getLabel(ctx.row.actor_name) || '';
+      const orig = steam.getLabel(ctx.row.actor_name) || '';
       labelEl.addEventListener('input', () => { saveEl.disabled = labelEl.value === orig; });
       saveEl.addEventListener('click', () => ctx.steam.saveLabel(labelEl.value));
     },
@@ -140,12 +138,12 @@ SMDB.partials = (() => {
     type: 'section',
     name: 'Transform',
     slot: 'postFields',
-    appliesTo: (row) => !!row && SMDB.classify.parseTransform(row.actor_transf) != null,
+    appliesTo: (row) => !!row && classify.parseTransform(row.actor_transf) != null,
     render(ctx) {
       const { t, escapeText } = ctx;
-      const tx = SMDB.classify.parseTransform(ctx.row.actor_transf);
+      const tx = classify.parseTransform(ctx.row.actor_transf);
       if (!tx) return '';
-      const bearing = SMDB.classify.bearingFromTransform(tx);
+      const bearing = classify.bearingFromTransform(tx);
       const facingHtml = bearing
         ? ` <span class="muted">(${escapeText(t('ui.detail.facing'))} ${escapeText(t('ui.compass.' + bearing, { default: bearing }))})</span>`
         : '';
@@ -183,7 +181,7 @@ SMDB.partials = (() => {
     type: 'field',
     name: 'PlayerLevel',
     fields: ['actor_level'],
-    appliesTo: (row) => SMDB.classify.isPlayerRow(row),
+    appliesTo: (row) => classify.isPlayerRow(row),
     renderField(ctx, field) {
       const { t, escapeText, escapeAttr } = ctx;
       const current = ctx.row[field] == null ? '' : String(ctx.row[field]);
@@ -207,11 +205,11 @@ SMDB.partials = (() => {
     slot: 'postFields',
     appliesTo: (row) => {
       if (!row) return false;
-      return SMDB.classify.isInventoryStorageRow(row) || SMDB.classify.isInventoryOwnerRow(row);
+      return classify.isInventoryStorageRow(row) || classify.isInventoryOwnerRow(row);
     },
     render(ctx) {
       const { t, escapeText, escapeAttr } = ctx;
-      const rel = SMDB.classify.findRelations(ctx.row, ctx.lookupRow, ctx.allRowsIter);
+      const rel = classify.findRelations(ctx.row, ctx.lookupRow, ctx.allRowsIter);
       if (!rel.parent && rel.children.length === 0) return '';
       const lines = [];
       if (rel.parent) {

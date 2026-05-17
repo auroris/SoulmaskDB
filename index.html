@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title data-i18n="ui.title">Soulmask world.db browser</title>
+<link rel="stylesheet" href="lib/datatables.net-dt/dataTables.dataTables.css">
 <style>
   :root {
     --bg: #1e1e1e;
@@ -51,6 +52,7 @@
   .stat b { color: var(--accent); font-weight: normal; }
   #controls { padding: 6px 12px; display: flex; gap: 8px; align-items: center;
     border-bottom: 1px solid var(--border); background: var(--panel); }
+  #controls[hidden] { display: none; }
   #controls #search { flex: 1; }
   #anchorChip { display: inline-flex; gap: 6px; align-items: center;
     padding: 2px 8px; border: 1px solid var(--border); border-radius: 12px;
@@ -128,6 +130,45 @@
   .loading { padding: 32px; text-align: center; color: var(--muted); flex: 1; }
   .loading code { background: var(--panel); padding: 2px 6px; border-radius: 2px; }
   #changedBadge { color: var(--warn); font-size: 11px; }
+
+  /* DataTables overrides — the package ships with a light theme. Map its
+     chrome to our dark palette so the pagination strip lives comfortably
+     in the existing layout. We only opt into the `paging` layout block;
+     no info / search / length-menu chrome is rendered. */
+  #rowsTable_wrapper { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+  div.dt-container div.dt-layout-row.dt-layout-table { flex: 1; min-height: 0; overflow: auto; }
+  div.dt-container div.dt-layout-row.dt-layout-table > div { width: 100%; }
+  div.dt-container div.dt-layout-row:last-child { padding: 6px 12px; border-top: 1px solid var(--border);
+    background: var(--panel); margin: 0; }
+  div.dt-container .dt-paging .dt-paging-button {
+    color: var(--text) !important; background: var(--panel2) !important;
+    border: 1px solid var(--border) !important; padding: 3px 9px !important;
+    margin: 0 2px; font: inherit !important; border-radius: 2px !important;
+  }
+  div.dt-container .dt-paging .dt-paging-button.current,
+  div.dt-container .dt-paging .dt-paging-button.current:hover {
+    color: var(--accent) !important; border-color: var(--accent) !important;
+    background: var(--panel) !important;
+  }
+  div.dt-container .dt-paging .dt-paging-button:hover:not(.disabled) {
+    border-color: var(--accent) !important; background: var(--panel2) !important;
+  }
+  div.dt-container .dt-paging .dt-paging-button.disabled,
+  div.dt-container .dt-paging .dt-paging-button.disabled:hover {
+    color: var(--muted) !important; opacity: 0.4; cursor: not-allowed;
+  }
+  div.dt-container .dt-paging .ellipsis { color: var(--muted); padding: 0 4px; }
+  /* Header sort indicators — DT injects span.dt-column-order in <th>s. */
+  table.dataTable thead > tr > th.dt-orderable-asc,
+  table.dataTable thead > tr > th.dt-orderable-desc,
+  table.dataTable thead > tr > th.dt-ordering-asc,
+  table.dataTable thead > tr > th.dt-ordering-desc { cursor: pointer; }
+  table.dataTable thead > tr > th .dt-column-order::before,
+  table.dataTable thead > tr > th .dt-column-order::after { color: var(--muted) !important; opacity: 0.6; }
+  table.dataTable thead > tr > th.dt-ordering-asc  .dt-column-order::before,
+  table.dataTable thead > tr > th.dt-ordering-desc .dt-column-order::after { color: var(--accent) !important; opacity: 1; }
+  /* DT injects empty/processing rows — give them sensible dark-theme contrast. */
+  table.dataTable tr.dt-empty td { color: var(--muted); text-align: center; padding: 16px !important; }
 
   /* Stash dialog. NB: the flex layout must be scoped to [open] so the
      browser's default `dialog:not([open]) { display: none }` still applies. */
@@ -224,10 +265,8 @@
   <select id="langSelect" data-i18n-title="ui.header.language" title="Language"></select>
   <button id="scriptsBtn" data-i18n="ui.header.scripts" data-i18n-title="ui.header.scripts.title" title="Browse distinct actor_script values, see what's unmapped" disabled>scripts</button>
   <button id="verifyAllBtn" data-i18n="ui.header.verifyCodec" data-i18n-title="ui.header.verifyCodec.title" title="Round-trip-decode every blob and report failures" disabled>verify codec</button>
-  <button id="steamCacheBtn" data-i18n-title="ui.header.steamCache.title" title="Clear locally cached Steam display names (dev affordance)" disabled>Steam cache (0)</button>
   <button id="stashBtn" data-i18n-title="ui.header.stash.title" title="Open the row stash">stash (0)</button>
   <span id="changedBadge"></span>
-  <button id="downloadBtn" class="primary" data-i18n="ui.header.download" disabled>Download modified .db</button>
 </header>
 
 <section id="summary" hidden></section>
@@ -257,13 +296,11 @@
 
 <main id="main">
   <div id="tableWrap">
-    <table id="rowsTable"><thead></thead><tbody></tbody></table>
+    <table id="rowsTable" class="display compact" style="width:100%"><thead></thead><tbody></tbody></table>
   </div>
   <div id="detailResizer" aria-hidden="true" role="separator" aria-orientation="vertical"></div>
   <aside id="detail" class="hidden"></aside>
 </main>
-
-<nav id="pagination" hidden></nav>
 
 <div id="empty" class="loading">
   <p data-i18n-html="ui.empty.choose">No database loaded. Click <b>files</b> or drop a <code>.db</code> on the page.</p>
@@ -352,29 +389,37 @@
 
 <!--
   Load order:
-    1. sqlite3.js (classic, deferred)        — exposes globalThis.sqlite3InitModule
-    2. js/bootstrap.mjs (ES module)          — populates window.SMDB.{unreal,codecs,…}
-                                               and dynamically imports js/app.mjs
-                                               at the end of its evaluation
-    3. legacy IIFE scripts (classic, defer)  — populate their own SMDB.* slots
+    1. sqlite3.js (classic, deferred) — exposes globalThis.sqlite3InitModule
+    2. js/bootstrap.mjs (ES module)   — imports everything (Unreal codecs,
+                                        services, i18n, classify, steam,
+                                        stash, partials, RowTable),
+                                        populates SMDB.* for transitional
+                                        callsites, then dynamically imports
+                                        js/app.mjs.
 
   bootstrap.mjs uses top-level `await` (transitively via blob.mjs's lz4
-  init). Browsers do NOT block subsequent classic `defer` scripts on a
-  TLA module's promise, so app.mjs MUST NOT be a classic defer script —
-  it would run while bootstrap is still paused and crash on a missing
-  SMDB.Orchestrator. Bootstrap dynamically imports app.mjs after its
-  own evaluation completes, which guarantees the right ordering. The
-  remaining classic defer scripts (i18n, classify, …) don't depend on
-  bootstrap and are safe to run in parallel with it.
+  init). The dynamic import of app.mjs at the end of bootstrap is what
+  guarantees SMDB.* is fully populated before app.mjs reads it. There
+  are no classic defer scripts in this page besides sqlite3.js, which
+  publishes its own self-contained global and doesn't depend on us.
 -->
+<!--
+  Import map for the few third-party packages we load as ESM via bare
+  specifiers (jquery + DataTables). Must appear BEFORE the first module
+  script that resolves any mapped name. The files are copied out of
+  node_modules at build time — see .eleventy.js passthroughs.
+-->
+<script type="importmap">
+{
+  "imports": {
+    "jquery":             "/lib/jquery/jquery.module.js",
+    "datatables.net":     "/lib/datatables.net/dataTables.mjs",
+    "datatables.net-dt":  "/lib/datatables.net-dt/dataTables.dataTables.mjs",
+    "flexsearch":         "/lib/flexsearch/flexsearch.module.mjs"
+  }
+}
+</script>
 <script src="lib/sqlite3/sqlite3.js" defer></script>
 <script type="module" src="js/bootstrap.mjs"></script>
-<script src="js/locale/en.js" defer></script>
-<script src="js/locale/zh.js" defer></script>
-<script src="js/i18n.js" defer></script>
-<script src="js/classify.js" defer></script>
-<script src="js/steam.js" defer></script>
-<script src="js/stash.js" defer></script>
-<script src="js/partials.js" defer></script>
 </body>
 </html>
