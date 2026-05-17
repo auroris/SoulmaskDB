@@ -37,7 +37,11 @@
 
 import { escapeText, escapeAttr } from './util.mjs';
 import { i18n } from './i18n.mjs';
-import { STRUCT_HANDLERS } from '../lib/unreal/structs.mjs';
+import { STRUCT_HANDLERS, StructValue } from '../lib/unreal/structs.mjs';
+
+// Canonical UE FGuid hex string — used to spot guid-shaped values inside
+// map keys / values so they render as jump links instead of opaque text.
+const GUID_RE = /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/;
 
 const t = (k, opts) => i18n.t(k, opts);
 
@@ -369,14 +373,51 @@ function renderMapValue(_tag, value, depth) {
   }
   const childDepth = depth + 1;
   const renderItem = (e /*, i */) => {
-    const keyHtml = `<code>${escapeText(stringifyForInline(e.key))}</code>`;
-    const valInline = ` → <code>${escapeText(stringifyForInline(e.value))}</code>`;
-    return renderSyntheticRow(keyHtml, valInline, '', childDepth);
+    const keyHtml = renderMapPartInline(e.key);
+    const valShape = renderMapValueShape(e.value, childDepth);
+    return renderSyntheticRow(keyHtml, valShape.inline, valShape.children, childDepth);
   };
   return {
     inline: `<span class="muted">${escapeText(t('ui.tree.entries', { count: entries.length }))}</span>`,
     children: renderCappedItems(entries, renderItem, childDepth),
   };
+}
+
+/**
+ * Inline HTML for the key (or a simple value) of a map entry. Guid-shaped
+ * strings render as jump links so a Map<Guid, _> entry's key becomes
+ * clickable navigation to the target row. Everything else falls back to
+ * the existing inline-stringify path.
+ */
+function renderMapPartInline(value) {
+  if (typeof value === 'string' && GUID_RE.test(value)) return renderGuidValue(value);
+  return `<code>${escapeText(stringifyForInline(value))}</code>`;
+}
+
+/**
+ * Shape for a map entry's value column:
+ *   StructValue (Soulmask "map value" = nested property stream)
+ *      → render the nested properties as expandable children, mirroring
+ *        the StructProperty render path. Without this, `value.value`
+ *        (the whole property array) used to land inside JSON.stringify
+ *        and dumped a multi-KB inline blob.
+ *   Guid-shaped string
+ *      → jump link.
+ *   anything else
+ *      → existing inline-stringify path.
+ */
+function renderMapValueShape(value, depth) {
+  if (value instanceof StructValue && Array.isArray(value.value)) {
+    const inner = value.value.map((p, i) => renderPropertyEntry(p, i, depth + 1)).join('');
+    return {
+      inline:   ` <span class="muted">${escapeText(t('ui.tree.items', { count: value.value.length }))}</span>`,
+      children: inner,
+    };
+  }
+  if (typeof value === 'string' && GUID_RE.test(value)) {
+    return { inline: ` → ${renderGuidValue(value)}`, children: '' };
+  }
+  return { inline: ` → <code>${escapeText(stringifyForInline(value))}</code>`, children: '' };
 }
 
 function stringifyForInline(v) {

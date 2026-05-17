@@ -108,15 +108,32 @@ order it deliberately.
   SearchService consumes. The walker that produced this data
   (`lib/unreal/refs.mjs::collectGuids`) lives upstream — the service
   itself is pure book-keeping. State:
-  - `_guidIndex: Map<guid, [{serial, path}]>` — every property
-    occurrence of a guid across all rows. Includes SelfUid entries
-    because that IS how a row's identity guid appears in the manifest;
-    filtered at the query layer so callers don't have to.
+  - `_guidIndex: Map<guid, [{serial, path, isIdentity}]>` — every
+    property occurrence of a guid across all rows. Each entry is
+    stamped with `isIdentity` at absorb time (true iff the path is
+    the row's identity-property for its kind — see below); the query
+    layer filters on that flag.
   - `_outboundByRow: Map<serial, [{guid, path}]>` — per-row outbound
-    refs (SelfUid excluded — identity, not a reference).
+    refs (identity entries excluded — they're "I AM this guid", not
+    a reference TO it).
   - `_selfUidByRow: Map<serial, guid>` and `_rowBySelfUid: Map<guid,
     serial>` — bidirectional lookup so an outbound ref resolves to a
     target row in O(1).
+
+  Identity-by-kind: the path that carries a row's own guid identity
+  depends on its classify kind. Conventions observed in `world.db`:
+  - **`player`** (HPlayerState) → `ZhuRenGuid`. Same property name is
+    a reference on NPC rows (master/owner pointer). Without this
+    distinction, all 5 player GUIDs would render unresolved and the
+    "Owned NPCs / Built objects / All referrers" buttons on a player
+    detail panel would surface nothing.
+  - **everyone else** → `SelfUid` (the default).
+  The mapping lives in `IDENTITY_PATH_BY_KIND` at the top of the
+  service file. The service doesn't classify rows itself — the
+  orchestrator wires a `kindLookup(serial) → kind` via
+  `setKindLookup()` after RowTable has loaded its rows. In tests
+  without a row table, the lookup is null and every row falls back
+  to `SelfUid` (which is fine for the NPC-only spot checks).
 
   Query API: `referrersOf(guid)`, `referrersOfRow(serial)`,
   `selfUidOf(serial)`, `rowBySelfUid(guid)`, `outboundFrom(serial)`
@@ -431,6 +448,59 @@ complexity is in type-dispatch + editor widgets, not tree mechanics,
 and a tree library's selection/focus model fights form controls inside
 nodes.
 
+## Soulmask custom `Map<Struct,Struct>` framing
+
+Soulmask uses several conventions inside `MapProperty<StructProperty,
+StructProperty>` that diverge from stock UE 4.27. Standard UE serializes
+struct keys and values as raw fields driven by reflection metadata —
+Soulmask doesn't have that metadata at deserialize time, so it inlines a
+mix of patterns that we sniff at decode. Discovered while decoding the
+five maps under `GAMEMODE.HGongHuiGuanLiQi.*` (the guild manager).
+
+- **Keys are raw 16-byte FGuids.** No inline struct shape; we assume
+  `Guid` for every `StructProperty` key. Every populated map we've seen
+  uses guild / player / entity guids as keys, so this holds.
+- **Values are *either* a nested property stream OR a raw FGuid**, with
+  no inline tag distinguishing the two:
+  - `GongHuiMap`, `PlayerGongHuiDataMap`, `GeRenJianZhuYingHuoList`,
+    `GeRenMapRiZhi` → values are tag-based property streams terminated
+    by `None`. Different from stock UE (where map struct values are raw
+    struct fields). Inside the property stream live the actual entity
+    data: guild names, member arrays, permission lists, etc.
+  - `PlayerGongHuiMap` → values are raw 16-byte FGuids (a
+    player-guid → guild-guid lookup).
+  We pick which shape by peeking the bytes after the key:
+  `peekLooksLikePropertyTag` in `lib/unreal/properties.mjs` looks for a
+  small positive int32 length prefix followed by NUL-terminated
+  identifier ASCII (`A-Z` / `a-z` / `0-9` / `_`). A random GUID's first
+  uint32 essentially never satisfies that; a property tag's name FString
+  always does. False-positive probability is below 1 in millions.
+- **`tag.size` is unreliable.** For the populated `GongHuiMap` the tag
+  reports `size = 632,838` bytes, but the actual data section is
+  `636,422` bytes (a 3,584-byte under-count). The decoder advances by
+  pair count + per-pair shape, not by `tag.size`, so the cursor lands
+  cleanly at the next property regardless. Round-trip writes the
+  original tag.size verbatim, so byte-identical re-emit still works
+  (verified: GAMEMODE round-trips on `UnrealBlob.verifyRoundTrip`, full
+  scan still 0 errors).
+
+End-to-end on world.db: the five guild-manager maps now decode (vs.
+falling back to OpaqueValue), `manifest.references` grows from 35,817
+to 38,227 entries / 32,592 → 34,079 distinct GUIDs / 11,791 → 11,800
+rows with refs. The property tree renders the guild row inline (Aleena
+appears as `HuiZhangUid → #18699`, `HuiZhangName: "Aleena"`,
+`ChuangJianZheName: "Alexander"`, member arrays, permission entries,
+3,088-item action log). `scripts/find-guid-refs.mjs --guid=<guildGuid>`
+now lists `[11] GAMEMODE — HGongHuiGuanLiQi.GongHuiMap[0].value.Uid`
+alongside the 1,043 referrers.
+
+The property tree renderer (`js/property-tree.mjs::renderMapValue`)
+expands `StructValue` map values as nested children rather than
+JSON-stringifying them inline (which was the prior behavior — and it
+visibly dumped a multi-KB blob into the row's summary). Guid-shaped
+keys and values render as jump links via the same `renderGuidValue`
+path the StructProperty(Guid) leaves use.
+
 ## Cross-row GUID references
 
 `scripts/find-guid-refs.mjs` walks every row of a DB, decodes the blob,
@@ -515,14 +585,31 @@ updates as rows are absorbed.
      A button is only rendered when its bucket is non-empty, so a row
      with no `ZhuRenGuid` referrers won't surface an "Owned NPCs"
      button.
-   - **Caveats on world.db alone.** Player rows (`SelfUid` = Aleena's
-     GUID) and guild rows live in `accounts.db`. With only `world.db`
-     loaded, NPC ZhuRenGuid/GongHuiGuid refs render unresolved, and
-     "Owned NPCs / Guild members / Built objects" filter buttons are
-     usually empty because the OWNER's SelfUid isn't a loaded row to
-     select-from. The richer queries become available once the UI
-     supports merging accounts.db + world.db into one logical row
-     set; left for later.
+   - **Open: virtual rows for nested entities.** Player identities
+     are now handled (HPlayerState's `ZhuRenGuid` is the player's own
+     guid). Guild data is also now decoded — see "Soulmask custom
+     `Map<Struct,Struct>` framing" below — but the entries live
+     INSIDE `GAMEMODE.HGongHuiGuanLiQi.GongHuiMap[*]`, not as standalone
+     `actor_table` rows. Today `referrersOf(guildGuid)` only resolves
+     to top-level row identities (via `IDENTITY_PATH_BY_KIND` keyed on
+     a row's `_kind`). For map-entry-as-entity resolution we'd want
+     to either:
+       - Synthesize virtual rows from map entries (one row per
+         `GongHuiMap` entry, etc.), with a path-prefix identity so
+         RowTable can render and select them. Most invasive but
+         cleanest model.
+       - Or extend `IDENTITY_PATH_BY_KIND` with a "nested identity"
+         entry: e.g. on `system` rows, paths matching
+         `HGongHuiGuanLiQi.GongHuiMap[*].value.Uid` are identity. The
+         service would need to walk the manifest's references list
+         and recognize those paths; `rowBySelfUid(guildGuid)` would
+         then return the GAMEMODE serial + the sub-path. RowTable
+         doesn't model sub-row navigation, so the UI would land you
+         on GAMEMODE with the guild's sub-tree expanded — needs
+         that affordance to be useful.
+     Until either lands, GongHuiGuid refs render unresolved in the
+     property tree (muted hex) and the "Guild members" filter button
+     stays empty for player rows.
    - **Additional reference kinds** (next slice). `ObjectProperty`
      instance suffixes (`BP_FooActor_C_2147481234`), `SoftObjectRef`
      asset paths, Steam IDs embedded in player blobs. Add new

@@ -68,18 +68,47 @@
  *     Sets keyed by `${serial}\0${path}`.
  */
 
+/**
+ * Identity-property convention by classified row kind. The default is
+ * 'SelfUid' — most NPCs / inventories / buildings put their identity
+ * guid at that path. Some row kinds use a different property:
+ *
+ *   player  → 'ZhuRenGuid'
+ *     On HPlayerState rows, `ZhuRenGuid` carries the PLAYER's own
+ *     identity, not a reference to an external master. The same
+ *     property name is a reference on NPC rows — same byte layout,
+ *     different semantics depending on which row holds it. Confirmed
+ *     across all 5 players in the sample world.db (each one's
+ *     ZhuRenGuid is unique and is what NPCs/buildings reference as
+ *     "owner").
+ *
+ * Adding new entries here is the way to teach the service about
+ * additional self-identity conventions if we discover them (guild
+ * rows, system rows, etc.).
+ */
+const IDENTITY_PATH_BY_KIND = {
+  player: 'ZhuRenGuid',
+};
+const DEFAULT_IDENTITY_PATH = 'SelfUid';
+
 export class ReferencesService {
   /**
    * @param {object} options
    * @param {object} options.codecs - codec registry (provides decode(u8))
    * @param {Function} options.collectGuids - the {path,guid} walker
    *   from lib/unreal/refs.mjs
+   * @param {Function} [options.kindLookup] - optional `(serial) → string|null`
+   *   used to decide which property path is identity for a given row.
+   *   Wired post-construction by the orchestrator to a row-table lookup;
+   *   absent (e.g. in tests) the service falls back to DEFAULT_IDENTITY_PATH
+   *   for every row.
    */
-  constructor({ codecs, collectGuids } = {}) {
+  constructor({ codecs, collectGuids, kindLookup = null } = {}) {
     if (!codecs)       throw new Error('ReferencesService: codecs is required');
     if (!collectGuids) throw new Error('ReferencesService: collectGuids is required');
     this._codecs       = codecs;
     this._collectGuids = collectGuids;
+    this._kindLookup   = kindLookup;
 
     this._guidIndex     = new Map();
     this._outboundByRow = new Map();
@@ -90,6 +119,14 @@ export class ReferencesService {
     this._listeners = new Set();
     this._epoch     = 0;
   }
+
+  /**
+   * Provide / replace the row-kind lookup used to resolve identity
+   * paths. Called by the orchestrator once RowTable's rows are loaded
+   * so the service can ask "what kind is this serial?" without owning
+   * its own row list.
+   */
+  setKindLookup(fn) { this._kindLookup = fn || null; }
 
   currentEpoch() { return this._epoch; }
 
@@ -175,16 +212,19 @@ export class ReferencesService {
   // ── queries ──────────────────────────────────────────────────────────
 
   /**
-   * Every row that mentions `guid` at a property OTHER than SelfUid
-   * (a SelfUid entry IS the row whose identity is that guid, not a
-   * referrer to it).
+   * Every row that mentions `guid` at a non-identity property (the
+   * identity entry IS the row whose identity is that guid, not a
+   * referrer to it). Identity is per-row-kind — for an HPlayerState
+   * row whose ZhuRenGuid IS its identity, that entry is filtered
+   * out; an NPC row's ZhuRenGuid pointing at the same guid is NOT
+   * filtered (it's a real reference).
    */
   referrersOf(guid) {
     const bucket = this._guidIndex.get(guid);
     if (!bucket) return [];
     const out = [];
     for (const entry of bucket) {
-      if (entry.path !== 'SelfUid') out.push(entry);
+      if (!entry.isIdentity) out.push({ serial: entry.serial, path: entry.path });
     }
     return out;
   }
@@ -244,6 +284,11 @@ export class ReferencesService {
     };
   }
 
+  _identityPathFor(serial) {
+    const kind = this._kindLookup ? this._kindLookup(serial) : null;
+    return (kind && IDENTITY_PATH_BY_KIND[kind]) || DEFAULT_IDENTITY_PATH;
+  }
+
   _absorbOne(serial, references) {
     // Idempotent — strip any prior entries for this serial first.
     if (this._outboundByRow.has(serial) || this._selfUidByRow.has(serial)) {
@@ -251,19 +296,27 @@ export class ReferencesService {
     }
     if (!Array.isArray(references) || references.length === 0) return;
 
+    const identityPath = this._identityPathFor(serial);
+
     let outbound = null;
     for (const ref of references) {
       if (ref.kind !== 'guid' || !ref.guid) continue;
+      const isIdentity = ref.path === identityPath;
 
       let bucket = this._guidIndex.get(ref.guid);
       if (!bucket) { bucket = []; this._guidIndex.set(ref.guid, bucket); }
-      bucket.push({ serial, path: ref.path });
+      // Stamp isIdentity on the bucket entry so `referrersOf` can filter
+      // without re-consulting `_kindLookup` per query — the row's kind is
+      // resolved once at absorb time. (If a row's kind ever changes after
+      // it's been absorbed, we'd need to re-absorb it; for now kinds are
+      // immutable per load.)
+      bucket.push({ serial, path: ref.path, isIdentity });
       this._totalRefs++;
 
-      if (ref.path === 'SelfUid') {
+      if (isIdentity) {
         this._selfUidByRow.set(serial, ref.guid);
-        // Last writer wins on collision. SelfUids are supposed to be
-        // unique; if two rows claim the same guid, the second to land
+        // Last writer wins on collision. Identity guids are supposed to
+        // be unique; if two rows claim the same one, the second to land
         // becomes the rowBySelfUid target. _guidIndex still has both
         // entries so referrersOf surfaces nothing surprising.
         this._rowBySelfUid.set(ref.guid, serial);

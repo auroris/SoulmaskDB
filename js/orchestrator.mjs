@@ -138,6 +138,16 @@ export class Orchestrator {
       i18n:         this._i18n,
     });
 
+    // ReferencesService asks "what kind is this row?" when absorbing a
+    // batch so identity convention can vary by kind (player rows put
+    // their identity at ZhuRenGuid; NPCs at SelfUid; etc.). We delegate
+    // the lookup to RowTable so the service stays decoupled from the
+    // row list.
+    this._references.setKindLookup((serial) => {
+      const r = this._rowTable.findRow(serial);
+      return r ? r._kind : null;
+    });
+
     // 4: stream fact-extractor batches into the search index.
     this._installFactForwarding();
   }
