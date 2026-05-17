@@ -89,6 +89,7 @@ export const en = {
   // ------------------------------------------------------------------ table
   'ui.tableHeader.serial':          '#',
   'ui.tableHeader.kind':            'kind',
+  'ui.tableHeader.name':            'name',
   'ui.tableHeader.class':           'class',
   'ui.tableHeader.summary':         'summary',
   'ui.tableHeader.owner':           'owner',

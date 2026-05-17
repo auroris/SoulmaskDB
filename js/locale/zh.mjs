@@ -80,6 +80,7 @@ export const zh = {
   'ui.detail.anchorRowActive':      '⚓ 已锚定',
 
   // ------------------------------------------------------------------ table
+  'ui.tableHeader.name':            '名称',
   'ui.tableHeader.distance':        '距离',
 
   // ----------------------------------------------------------- spatial anchor

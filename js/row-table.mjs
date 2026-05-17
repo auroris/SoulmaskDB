@@ -50,6 +50,7 @@ import DataTable from 'datatables.net-dt';
 import 'datatables.net-columncontrol-dt';
 import 'datatables.net-colreorder-dt';
 import { escapeText, escapeAttr, debounce, fmtBytes } from './util.mjs';
+import { deriveName } from '../lib/unreal/facts.mjs';
 
 // Register a plain-text search content type with ColumnControl. The
 // stock `searchText` always renders an operator <select> ("Contains",
@@ -128,6 +129,8 @@ export class RowTable {
 
     // Re-apply filters after a burst of blob-indexing batches lands.
     this._refreshOnIndex = debounce(() => this._dtApi?.draw(false), 150);
+    // Re-render after name facts stream in from workers.
+    this._refreshOnFacts = debounce(() => this._dtApi?.draw(false), 200);
   }
 
   // ---- lifecycle ---------------------------------------------------------
@@ -260,6 +263,26 @@ export class RowTable {
   }
 
   // ---- mutators ----------------------------------------------------------
+
+  /**
+   * Apply name facts from a worker decode batch. Each item is `{serial, manifest}`.
+   * Updates `row._name` for rows that have player-set names and schedules a
+   * debounced redraw so the Name column picks them up as they stream in.
+   */
+  absorbFacts(items) {
+    if (!Array.isArray(items)) return;
+    let changed = false;
+    for (const { serial, manifest } of items) {
+      if (!manifest?.facts) continue;
+      const name = deriveName(manifest.facts);
+      if (!name) continue;
+      const row = this.findRow(serial);
+      if (!row || row._name === name) continue;
+      row._name = name;
+      changed = true;
+    }
+    if (changed) this._refreshOnFacts();
+  }
 
   upsertRow(row) {
     const serial = row.actor_serial;
@@ -516,7 +539,25 @@ export class RowTable {
         },
       },
       {
-        // 3: class (label + optional Steam display name)
+        // 3: player-set name (JianZhuDisplayName, CurGaoShiString, NPC notes).
+        // Populated asynchronously as decode workers stream in manifests.
+        name:  'name',
+        title: t('ui.tableHeader.name'),
+        data:  '_name',
+        orderable: false,
+        columnControl: [
+          {
+            extend: 'dropdown', icon: 'search',
+            content: [{ extend: 'searchPlain', placeholder: 'name' }],
+          },
+        ],
+        render: (data, type) => {
+          if (type !== 'display') return data || '';
+          return data ? escapeText(data) : '';
+        },
+      },
+      {
+        // 4: class (label + optional Steam display name)
         title: t('ui.tableHeader.class'),
         data:  '_label',
         orderable: false,

@@ -182,6 +182,7 @@ export class Orchestrator {
       if (event === 'batch') {
         this._search.absorbBatch(data.items, { epoch: this._activeSearchEpoch });
         this._references.absorbBatch(data.items, { epoch: this._activeRefsEpoch });
+        this._rowTable.absorbFacts(data.items);
       } else if (event === 'done') {
         this._search.markDone({ epoch: this._activeSearchEpoch });
         this._references.markDone({ epoch: this._activeRefsEpoch });
