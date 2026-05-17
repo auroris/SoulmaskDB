@@ -249,11 +249,13 @@ if (parallelEnabled) {
     else if (m.manifest.decodeOk && m.manifest.kind !== s.kind) mismatches++;
   }
 
-  // Haystack-index sanity: every successfully-decoded non-empty blob
-  // should produce a non-empty `text` field. Report aggregate stats and
-  // a single sample so the output makes it obvious whether the index is
-  // meaningful or trivially empty.
+  // Haystack-index + references sanity: every successfully-decoded
+  // non-empty blob should produce a non-empty `text` field. The new
+  // `references` field carries Guid struct values + their property
+  // paths so a ReferencesService can build a reverse index without
+  // re-decoding blobs.
   let totalChars = 0, maxChars = 0, rowsWithEmptyText = 0;
+  let totalRefs = 0, maxRefs = 0, rowsWithRefs = 0;
   let sampleRow = null;
   for (const m of manifests) {
     const len = m.manifest.text?.length ?? 0;
@@ -261,6 +263,11 @@ if (parallelEnabled) {
     if (len > maxChars) maxChars = len;
     if (m.manifest.decodeOk && len === 0) rowsWithEmptyText++;
     if (!sampleRow && m.manifest.decodeOk && len >= 80) sampleRow = m;
+
+    const refCount = m.manifest.references?.length ?? 0;
+    totalRefs += refCount;
+    if (refCount > maxRefs) maxRefs = refCount;
+    if (refCount > 0) rowsWithRefs++;
   }
 
   console.log(`  Items decoded:   ${manifests.length}`);
@@ -268,6 +275,8 @@ if (parallelEnabled) {
   console.log(`  Haystack chars:  ${totalChars.toLocaleString()} ` +
               `(avg ${(totalChars / Math.max(1, manifests.length)).toFixed(0)}/row, max ${maxChars})`);
   console.log(`  Rows w/ '' text: ${rowsWithEmptyText} (decoded OK but empty haystack)`);
+  console.log(`  GUID refs:       ${totalRefs.toLocaleString()} ` +
+              `(avg ${(totalRefs / Math.max(1, manifests.length)).toFixed(1)}/row, max ${maxRefs}, ${rowsWithRefs} rows have any)`);
   console.log(`  Wall clock:      ${parallelMs} ms (${(parallelMs / Math.max(1, manifests.length)).toFixed(2)} ms/row)`);
   console.log(`  Speedup vs ser.: ${(elapsedMs / Math.max(1, parallelMs)).toFixed(2)}x`);
 
@@ -279,6 +288,95 @@ if (parallelEnabled) {
   }
 
   if (mismatches > 0) parallelExitCode = 1;
+
+  // ── ReferencesService end-to-end ───────────────────────────────────
+  // Build the same reverse index the browser builds at load time,
+  // using the manifests the worker pool just produced. Verifies the
+  // service's absorb path + query API against real data and lets the
+  // node test surface regressions in either layer.
+  console.log('');
+  console.log('=== ReferencesService ===');
+  const { ReferencesService } = await import('./js/references-service.mjs');
+  const { collectGuids }      = await import('./lib/unreal/refs.mjs');
+  const refsSvc = new ReferencesService({ codecs, collectGuids });
+
+  const tBuild0 = Date.now();
+  refsSvc.absorbBatch(manifests);
+  const buildMs = Date.now() - tBuild0;
+  const refsStats = refsSvc.stats();
+  console.log(`  Build time:      ${buildMs} ms`);
+  console.log(`  Stats:           ${JSON.stringify(refsStats)}`);
+
+  // Pick a high-fanout GUID from the index and confirm the queries
+  // line up with what scripts/find-guid-refs.mjs would print.
+  let topGuid = null, topBucket = 0;
+  for (const [guid, bucket] of refsSvc._guidIndex) {
+    if (bucket.length > topBucket) { topGuid = guid; topBucket = bucket.length; }
+  }
+  if (topGuid) {
+    const referrers = refsSvc.referrersOf(topGuid);
+    const target    = refsSvc.rowBySelfUid(topGuid);
+    console.log(`  Top GUID:        ${topGuid}`);
+    console.log(`    referrers:     ${referrers.length} (${topBucket} total occurrences, SelfUid filtered)`);
+    console.log(`    rowBySelfUid:  ${target ?? '(not in loaded set)'}`);
+    if (target != null) {
+      const outbound = refsSvc.outboundFrom(target);
+      const resolved = outbound.filter(o => o.targetSerial != null);
+      console.log(`    outboundFrom target row: ${outbound.length} refs, ${resolved.length} resolve to a loaded row`);
+    }
+  }
+
+  // Sanity: every row that had `kind:'guid'` references in its
+  // manifest is reflected in the service. Both maps contribute —
+  // rowsWithSelfUid covers SelfUid-only rows; _outboundByRow covers
+  // outbound-only rows; their union covers rows with both. The
+  // intersection on world.db is small because most NPCs with outbound
+  // refs (ZhuRenGuid → owner) also carry a SelfUid, but only a few
+  // hundred actually do — most building-style rows are outbound-only.
+  const manifestsWithRefs = manifests.filter(m => (m.manifest.references?.length ?? 0) > 0).length;
+  const serviceUnion = new Set([
+    ...refsSvc._outboundByRow.keys(),
+    ...refsSvc._selfUidByRow.keys(),
+  ]);
+  const coverageMismatch = serviceUnion.size !== manifestsWithRefs;
+  console.log(`  Coverage:        ${serviceUnion.size}/${manifestsWithRefs} ${coverageMismatch ? '— MISMATCH' : '(ok)'}`);
+  if (coverageMismatch) parallelExitCode = 1;
+
+  // Spot-check against the user-supplied NPC at serial 38139. The
+  // properties on that row are ZhuRenGuid / GongHuiGuid / SelfUid;
+  // the service should expose all three through the right APIs.
+  const NPC_SERIAL  = 38139;
+  const NPC_SELF    = 'F1C92EF8-3DDA-4BDA-82F2-0E39DF5540D7';
+  const NPC_OWNER   = 'C843A973-AA2D-4A30-A5CF-D529A4CDB028';
+  const NPC_GUILD   = 'AE178FF3-FE45-46C5-BE15-3CD2FA66DF22';
+  const hasNpc = manifests.some(m => m.serial === NPC_SERIAL);
+  if (hasNpc) {
+    const checks = [];
+    checks.push(['selfUidOf(38139)', refsSvc.selfUidOf(NPC_SERIAL), NPC_SELF]);
+    checks.push(['rowBySelfUid(NPC_SELF)', refsSvc.rowBySelfUid(NPC_SELF), NPC_SERIAL]);
+    const outbound = refsSvc.outboundFrom(NPC_SERIAL);
+    const outByPath = new Map(outbound.map(o => [o.path, o.guid]));
+    checks.push(['outbound.ZhuRenGuid', outByPath.get('ZhuRenGuid'), NPC_OWNER]);
+    checks.push(['outbound.GongHuiGuid', outByPath.get('GongHuiGuid'), NPC_GUILD]);
+    // referrersOf the NPC's SelfUid should include the player row 18699
+    // (their ControlledPawn + ChuShiKeLongData.ManRenUId point at it).
+    const referrers = refsSvc.referrersOf(NPC_SELF);
+    const fromPlayer = referrers.filter(r => r.serial === 18699).map(r => r.path).sort();
+    checks.push([
+      'referrersOf(NPC_SELF) from player 18699',
+      JSON.stringify(fromPlayer),
+      JSON.stringify(['ChuShiKeLongData.ManRenUId', 'ControlledPawn']),
+    ]);
+    let failed = 0;
+    for (const [label, got, want] of checks) {
+      const ok = got === want;
+      console.log(`    ${ok ? 'OK ' : 'FAIL'} ${label}: got ${got}${ok ? '' : ` (want ${want})`}`);
+      if (!ok) failed++;
+    }
+    if (failed > 0) parallelExitCode = 1;
+  } else {
+    console.log('    (NPC serial 38139 not in this DB — skipping spot-checks)');
+  }
 }
 
 process.exit(problemCount > 0 || parallelExitCode > 0 ? 1 : 0);

@@ -14,8 +14,9 @@
  *            data.init({ sqlite, orchestrator })
  *            rowTable.init({ orchestrator, search, dataService,
  *                            classify, steam, i18n })
- *      d. Wire FactExtractor → SearchService forwarding so per-batch
- *         blob manifests stream into the search index as they land.
+ *      d. Wire FactExtractor → SearchService + ReferencesService
+ *         forwarding so per-batch blob manifests stream into both
+ *         downstream indices as they land.
  *
  *   2. File-load lifecycle (per-call, via `loadFile()`):
  *      1. User picks a file → DataService hands the bytes to `loadFile`.
@@ -25,10 +26,11 @@
  *      4. Query all rows, run classify, build per-row summaries, emit
  *         'rows-ready' so the UI can render immediately (without
  *         blob-text matches).
- *      5. Clear the search index, then kick FactExtractor.decode for
- *         all blob bytes — fire-and-let-it-stream.
+ *      5. Clear the search + references indices, then kick
+ *         FactExtractor.decode for all blob bytes —
+ *         fire-and-let-it-stream.
  *      6. The forwarding subscription installed in step 1d feeds each
- *         worker `batch` event into SearchService, filtered by per-load
+ *         worker `batch` event into both indices, filtered by per-load
  *         callId so a second loadFile-while-A-still-decoding correctly
  *         abandons A's leftover batches.
  *      7. When the decode promise resolves, emit 'file-loaded' and the
@@ -49,10 +51,10 @@
  * Stale-call safety:
  *   Two orthogonal guards. (1) Each loadFile() captures a `_loadId`
  *   counter and bails after any await if a newer call has started.
- *   (2) The worker-to-search subscription tracks a per-load callId so
- *   leftover batches from an abandoned load never touch the new
- *   SearchService state. Plus SearchService's own epoch on absorbBatch
- *   as a third belt-and-braces layer.
+ *   (2) The worker-to-consumers subscription tracks a per-load callId
+ *   so leftover batches from an abandoned load never touch the new
+ *   SearchService / ReferencesService state. Plus each consumer's own
+ *   epoch on absorbBatch as a third belt-and-braces layer.
  */
 
 import { bindLz4 } from '../lib/unreal/blob.mjs';
@@ -61,8 +63,8 @@ export class Orchestrator {
   constructor({
     // wasm services (init() runs in Promise.all)
     lz4, sqlite,
-    // parallel decode + search/data/table
-    factExtractor, search, data, rowTable,
+    // parallel decode + search/references/data/table
+    factExtractor, search, references, data, rowTable,
     // utility modules with no async init, threaded into sub-module init
     classify, steam, i18n,
   }) {
@@ -70,6 +72,7 @@ export class Orchestrator {
     if (!sqlite)         throw new Error('Orchestrator: sqlite is required');
     if (!factExtractor)  throw new Error('Orchestrator: factExtractor is required');
     if (!search)         throw new Error('Orchestrator: search is required');
+    if (!references)     throw new Error('Orchestrator: references is required');
     if (!data)           throw new Error('Orchestrator: data is required');
     if (!rowTable)       throw new Error('Orchestrator: rowTable is required');
     if (!classify)       throw new Error('Orchestrator: classify is required');
@@ -80,6 +83,7 @@ export class Orchestrator {
     this._sqlite         = sqlite;
     this._factExtractor  = factExtractor;
     this._search         = search;
+    this._references     = references;
     this._data           = data;
     this._rowTable       = rowTable;
     this._classify       = classify;
@@ -90,14 +94,18 @@ export class Orchestrator {
     this._loadId    = 0;
     this._currentFileLabel = null;
 
-    // Per-load state used by the fact-extractor→search forwarding listener
-    // installed in init(). `_activeTag` matches the tag attached to events
-    // from the current load's decode() call; absorbBatch is short-circuited
-    // on tag mismatch so leftover batches from an abandoned load can't
-    // pollute the new search index.
-    this._activeTag    = null;
-    this._activeEpoch  = 0;
-    this._initialized  = false;
+    // Per-load state used by the fact-extractor→{search,references}
+    // forwarding listener installed in init(). `_activeTag` matches the
+    // tag attached to events from the current load's decode() call;
+    // absorbBatch is short-circuited on tag mismatch so leftover batches
+    // from an abandoned load can't pollute the new state.
+    // Each consumer service has its own epoch — they're cleared in
+    // lock-step in loadFile but advance independently, so we capture
+    // both at clear-time and pass each its own value.
+    this._activeTag        = null;
+    this._activeSearchEpoch = 0;
+    this._activeRefsEpoch   = 0;
+    this._initialized       = false;
   }
 
   /**
@@ -150,23 +158,28 @@ export class Orchestrator {
   db() { return this._sqlite.current(); }
 
   /**
-   * Wire FactExtractor events into SearchService. Installed once during
+   * Wire FactExtractor events into the downstream services
+   * (SearchService and ReferencesService). Installed once during
    * init(). Each loadFile() updates `_activeTag` so this listener
-   * forwards only batches from the active decode pass.
+   * forwards only batches from the active decode pass. Each consumer
+   * gets its own captured epoch so a service can be cleared
+   * independently without coordinating epoch values across services.
    */
   _installFactForwarding() {
     this._factExtractor.addListener((event, data) => {
       if (!data) return;
       if (this._activeTag == null || data.tag !== this._activeTag) return;
       if (event === 'batch') {
-        this._search.absorbBatch(data.items, { epoch: this._activeEpoch });
+        this._search.absorbBatch(data.items, { epoch: this._activeSearchEpoch });
+        this._references.absorbBatch(data.items, { epoch: this._activeRefsEpoch });
       } else if (event === 'done') {
-        this._search.markDone({ epoch: this._activeEpoch });
+        this._search.markDone({ epoch: this._activeSearchEpoch });
+        this._references.markDone({ epoch: this._activeRefsEpoch });
       } else if (event === 'error') {
-        // Search 'done' wouldn't fire in this case — surface the error
-        // so the UI can recover. The decode promise's catch in loadFile
-        // also runs, but emitting here keeps the event-driven path
-        // self-contained.
+        // Neither service's 'done' will fire in this case — surface
+        // the error so the UI can recover. The decode promise's catch
+        // in loadFile also runs, but emitting here keeps the
+        // event-driven path self-contained.
         this._emit('load-error', { error: data.error, label: this._currentFileLabel });
       }
     });
@@ -223,11 +236,13 @@ export class Orchestrator {
 
       const serverId = this._detectServerId(handle);
 
-      // Reset the search index for the new file BEFORE we emit rows-ready,
-      // so consumers that read SearchService state on that event see a
-      // clean slate.
+      // Reset the downstream indices for the new file BEFORE we emit
+      // rows-ready, so consumers that read SearchService /
+      // ReferencesService state on that event see a clean slate.
       this._search.clear();
-      const epoch = this._search.currentEpoch();
+      this._references.clear();
+      const searchEpoch = this._search.currentEpoch();
+      const refsEpoch   = this._references.currentEpoch();
 
       // Announce the metadata. UI renders immediately on this event.
       this._emit('rows-ready', { rows, handle, serverId, label });
@@ -237,8 +252,9 @@ export class Orchestrator {
       // once during init() and matches on `data.tag`, so anything
       // currently in flight from an older load (different tag) is
       // automatically dropped.
-      this._activeEpoch = epoch;
-      this._activeTag   = myLoadId;
+      this._activeSearchEpoch = searchEpoch;
+      this._activeRefsEpoch   = refsEpoch;
+      this._activeTag         = myLoadId;
 
       try {
         await this._factExtractor.decode(indexItems, { tag: myLoadId });
@@ -288,12 +304,14 @@ export class Orchestrator {
     const row = rows[0];
     if (!row) {
       this._search.dropRow(serial);
+      this._references.dropRow(serial);
       return null;
     }
     row.blob_size = row.actor_data ? row.actor_data.length : 0;
     const c = this._classify.classify(row);
     row._kind = c.kind; row._label = c.label; row._summary = c.summary;
     this._search.refreshRow(serial, row.actor_data);
+    this._references.refreshRow(serial, row.actor_data);
     row.actor_data = null;
     return row;
   }

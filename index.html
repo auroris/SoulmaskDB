@@ -61,6 +61,11 @@
   #anchorChip label { color: var(--muted); }
   #anchorChip input[type="number"] { padding: 1px 4px; }
   #anchorChip button { padding: 0 6px; }
+  #relationshipChip { display: inline-flex; gap: 6px; align-items: center;
+    padding: 2px 8px; border: 1px solid var(--accent); border-radius: 12px;
+    background: var(--panel2); font-size: 12px; color: var(--accent); }
+  #relationshipChip.hidden { display: none; }
+  #relationshipChip button { padding: 0 6px; }
   main { flex: 1; display: grid; grid-template-columns: 1fr; overflow: hidden; }
   /* Three-column grid when the detail panel is visible:
        [table (1fr)]  [resizer (4px)]  [detail (--detail-width, default 40%)]
@@ -206,6 +211,29 @@
   details.prop-node       > summary > .prop-chevron::before { content: '▸'; }
   details.prop-node[open] > summary > .prop-chevron::before { content: '▾'; }
 
+  /* Guid struct leaves render as jump links (resolved) or muted hex
+     (unresolved — no loaded row claims that SelfUid). The resolved form
+     also surfaces a "→ #<serial>" hint after the GUID. */
+  .prop-guid { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  a.prop-guid.resolved { color: var(--accent); text-decoration: none; }
+  a.prop-guid.resolved code { background: var(--bg); padding: 0 4px; border-radius: 2px;
+    color: var(--accent); font-size: 11px; }
+  a.prop-guid.resolved:hover code { background: var(--panel2); }
+  a.prop-guid.resolved:hover { text-decoration: underline; }
+  code.prop-guid.unresolved { color: var(--muted); background: var(--bg); padding: 0 4px;
+    border-radius: 2px; font-size: 11px; }
+
+  /* Relationships section in the detail panel.
+       .rel-row     one outbound ref (parent), e.g. "ZhuRenGuid → #18699 Aleena"
+       .rel-filters row of buttons that constrain the table to inbound refs. */
+  .rel-row { display: flex; gap: 8px; align-items: baseline;
+    padding: 2px 0; font-size: 12px; }
+  .rel-row .rel-path { color: var(--muted); min-width: 130px; }
+  .rel-row .rel-target { color: var(--text); word-break: break-all; }
+  .rel-row a.prop-guid.resolved { color: var(--accent); }
+  .rel-filters { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+  .rel-filters button.active { border-color: var(--accent); color: var(--accent); }
+
   /* Verify results */
   #verifyDialog .verify-summary { padding: 10px 14px; border-bottom: 1px solid var(--border); }
   #verifyDialog .verify-fail { padding: 6px 10px; border-bottom: 1px solid var(--panel2); font-size: 11px; }
@@ -292,6 +320,7 @@
   <span id="filterCount" class="muted"></span>
   <button id="anchorAtBtn" data-i18n="ui.anchor.atButton" data-i18n-title="ui.anchor.atButton.title">📍 anchor at…</button>
   <span id="anchorChip" class="hidden"></span>
+  <span id="relationshipChip" class="hidden"></span>
 </section>
 
 <main id="main">

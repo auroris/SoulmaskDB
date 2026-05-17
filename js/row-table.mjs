@@ -63,6 +63,14 @@ export class RowTable {
     this._selectedSerial = null;
     this._anchor         = null;   // { serial, label, pos: [x,y,z], rangeMeters }
 
+    // Relationship filter — set by app.mjs in response to a "show owned NPCs",
+    // "show built by", etc. detail-panel button. When non-null, the custom
+    // search predicate hides every row whose serial isn't in `serials`.
+    // `originSerial` is the row whose relationships this filter expresses;
+    // we use it to clear the filter automatically if that row's selection
+    // moves off, and to render a useful chip label.
+    this._relationshipFilter = null;   // { label, kind, originSerial, serials: Set<number> }
+
     this._listeners = new Set();
     this._dtApi     = null;
     this._initialized = false;
@@ -128,6 +136,7 @@ export class RowTable {
   hasAnchor()     { return !!this._anchor; }
   isAnchoredOn(serial) { return !!this._anchor && this._anchor.serial === serial; }
   anchor()        { return this._anchor; }
+  relationshipFilter() { return this._relationshipFilter; }
   currentFileLabel() { return this._currentFileLabel; }
   currentServerId()  { return this._currentServerId; }
 
@@ -174,6 +183,41 @@ export class RowTable {
     this._selectedSerial = null;
     this._dtApi?.draw(false);
     this._emit('row-deselected', {});
+  }
+
+  /**
+   * Constrain the visible row set to the given `serials`. Caller usually
+   * builds the set from a ReferencesService query (e.g. referrersOf the
+   * selected row's SelfUid, optionally filtered by property path). The
+   * filter is independent of the text search + kind filter — they
+   * intersect.
+   *
+   * @param {object} opts
+   * @param {string} opts.label        chip label shown in the controls bar
+   * @param {string} [opts.kind]       informational tag (e.g. 'owned',
+   *                                   'built', 'guild', 'all') — surfaced
+   *                                   to listeners that want to label
+   *                                   active-button state.
+   * @param {number} [opts.originSerial] the row this filter was derived
+   *                                   from. Lets a future "follow
+   *                                   selection" mode auto-clear when the
+   *                                   user navigates elsewhere.
+   * @param {Iterable<number>} opts.serials
+   */
+  setRelationshipFilter({ label, kind = null, originSerial = null, serials } = {}) {
+    const set = serials instanceof Set ? serials : new Set(serials || []);
+    this._relationshipFilter = { label, kind, originSerial, serials: set };
+    this._renderRelationshipChip();
+    this._dtApi?.draw();
+    this._emit('relationship-filter-changed', { active: true, label, kind, originSerial, count: set.size });
+  }
+
+  clearRelationshipFilter() {
+    if (!this._relationshipFilter) return;
+    this._relationshipFilter = null;
+    this._renderRelationshipChip();
+    this._dtApi?.draw();
+    this._emit('relationship-filter-changed', { active: false });
   }
 
   setRowAsAnchor(row) {
@@ -386,6 +430,14 @@ export class RowTable {
 
     const filter = (settings, _renderedData, _index, rowData) => {
       if (!settings.nTable || settings.nTable.id !== tableId) return true;
+      // Relationship filter is an explicit allow-list, so it short-circuits
+      // first — hides every row whose serial isn't in the set, regardless
+      // of text search / kind / anchor. The other filters still apply on
+      // top of it (intersection semantics) so a user can text-search
+      // inside the relationship subset.
+      if (this._relationshipFilter && !this._relationshipFilter.serials.has(rowData.actor_serial)) {
+        return false;
+      }
       const q = (this._queryStr || '').toLowerCase();
       const k = this._kindStr || '';
       if (k && rowData._kind !== k) return false;
@@ -485,6 +537,30 @@ export class RowTable {
     for (const r of this._allRows) this._stampDistance(r);
   }
 
+  _renderRelationshipChip() {
+    const chip = document.getElementById('relationshipChip');
+    if (!chip) return;
+    const f = this._relationshipFilter;
+    if (!f) {
+      chip.classList.add('hidden');
+      chip.innerHTML = '';
+      return;
+    }
+    const t = this._t.bind(this);
+    chip.classList.remove('hidden');
+    const summary = t('ui.relationship.chipLabel', {
+      label: f.label,
+      count: f.serials.size.toLocaleString(),
+      default: '{label} ({count})',
+    });
+    chip.innerHTML = `
+      <span class="rel-label">${escapeText(summary)}</span>
+      <button id="relationshipClear" title="${escapeAttr(t('ui.relationship.clear', { default: 'clear relationship filter' }))}">×</button>
+    `;
+    document.getElementById('relationshipClear')
+      .addEventListener('click', () => this.clearRelationshipFilter());
+  }
+
   _renderAnchorChip() {
     const chip = document.getElementById('anchorChip');
     if (!chip) return;
@@ -552,8 +628,10 @@ export class RowTable {
         this._currentServerId  = data.serverId;
         this._selectedSerial   = null;
         this._anchor           = null;
+        this._relationshipFilter = null;
         this._stampAllDistances();
         this._renderAnchorChip();
+        this._renderRelationshipChip();
         if (this._dtApi) {
           this._dtApi.column(1).visible(false, false);
           this._dtApi.order([0, 'asc']);
@@ -574,7 +652,9 @@ export class RowTable {
       this._currentServerId  = null;
       this._selectedSerial   = null;
       this._anchor           = null;
+      this._relationshipFilter = null;
       this._renderAnchorChip();
+      this._renderRelationshipChip();
       this._reloadDtData({ preservePaging: false });
       this._emit('rows-replaced', { rows: [], label: null, serverId: null });
     });

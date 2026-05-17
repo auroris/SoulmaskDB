@@ -103,6 +103,31 @@ order it deliberately.
   so `hasIndex()` is O(1) and refresh paths can do `remove` before
   `add` (FlexSearch's `add` would double-index an existing id).
 
+- **`ReferencesService`** (`js/references-service.mjs`). Cross-row GUID
+  reverse index, fed by the same FactExtractor `batch` events
+  SearchService consumes. The walker that produced this data
+  (`lib/unreal/refs.mjs::collectGuids`) lives upstream — the service
+  itself is pure book-keeping. State:
+  - `_guidIndex: Map<guid, [{serial, path}]>` — every property
+    occurrence of a guid across all rows. Includes SelfUid entries
+    because that IS how a row's identity guid appears in the manifest;
+    filtered at the query layer so callers don't have to.
+  - `_outboundByRow: Map<serial, [{guid, path}]>` — per-row outbound
+    refs (SelfUid excluded — identity, not a reference).
+  - `_selfUidByRow: Map<serial, guid>` and `_rowBySelfUid: Map<guid,
+    serial>` — bidirectional lookup so an outbound ref resolves to a
+    target row in O(1).
+
+  Query API: `referrersOf(guid)`, `referrersOfRow(serial)`,
+  `selfUidOf(serial)`, `rowBySelfUid(guid)`, `outboundFrom(serial)`
+  (returns `[{guid, path, targetSerial}]` with the target resolved).
+  Idempotent `absorbBatch` + the same `clear()`/epoch protection as
+  SearchService. Single-row mutation via `refreshRow(serial, bytes)` /
+  `dropRow(serial)` mirrors SearchService's bypass-the-pool path.
+  Build cost on world.db: ~30 ms for 12,027 rows / 35,817 refs after
+  the worker pool has produced the manifests (`node test.mjs
+  --parallel` reports this alongside haystack stats).
+
 - **`DataService`** (`js/data-service.mjs`). **Public entry point for
   DB-file work.** Owns the file-list lifecycle in the page: drag/drop
   bound on `window`, the `<dialog id="dataDialog">` UI, the per-file
@@ -121,12 +146,14 @@ order it deliberately.
 - **`RowTable`** (`js/row-table.mjs`). DataTables-backed view over
   `actor_table` rows. Owns the `<table>` DOM, the surrounding controls
   (`#search`, `#kindFilter`, `#filterCount`, `#anchorAtBtn`,
-  `#anchorChip`), the canonical `allRows` list (formerly on app.mjs),
-  the selection state, and the spatial-anchor filter. Subscribes to
-  orchestrator `rows-ready`, data `unloaded`, and search
-  `batch`/`done`/`reset` directly. Emits `row-selected`,
-  `row-deselected`, `rows-replaced` so app.mjs can react without
-  touching the table itself.
+  `#anchorChip`, `#relationshipChip`), the canonical `allRows` list
+  (formerly on app.mjs), the selection state, the spatial-anchor
+  filter, and a relationship filter (an allow-list of serials sourced
+  from `ReferencesService` queries — see "Cross-row GUID references"
+  below). Subscribes to orchestrator `rows-ready`, data `unloaded`,
+  and search `batch`/`done`/`reset` directly. Emits `row-selected`,
+  `row-deselected`, `rows-replaced`, `relationship-filter-changed`
+  so app.mjs can react without touching the table itself.
 
 - **`Orchestrator`** (`js/orchestrator.mjs`). Composition root AND
   file-load lifecycle.
@@ -139,9 +166,11 @@ order it deliberately.
     3. `await data.init({ sqlite, orchestrator: this })`
     4. `await rowTable.init({ orchestrator: this, search, dataService,
        classify, steam, i18n })`
-    5. Install the FactExtractor → SearchService forwarding listener
-       (filtered by per-load tag so an abandoned load's leftover batches
-       don't pollute the new search index).
+    5. Install the FactExtractor → {SearchService, ReferencesService}
+       forwarding listener (filtered by per-load tag so an abandoned
+       load's leftover batches don't pollute the new indices). Each
+       consumer carries its own captured epoch so they can be cleared
+       independently without coordinating across services.
   - `loadFile(bytes, label)` (per-call, only called by
     `DataService.switchTo`):
     1. `sqlite.open(bytes)` → handle.
@@ -149,13 +178,16 @@ order it deliberately.
     3. Query rows + run classify on each.
     4. Emit `'rows-ready'` BEFORE any blob decoding — UI renders
        immediately on SQL columns.
-    5. `search.clear()`, then `factExtractor.decode(items, { tag:
-       myLoadId })`.
-    6. Forwarding listener (installed in init) routes `batch` events to
-       `search.absorbBatch(items, { epoch })`, filtered by `tag`.
+    5. `search.clear()` + `references.clear()`, then
+       `factExtractor.decode(items, { tag: myLoadId })`. Both consumer
+       epochs are captured here.
+    6. Forwarding listener (installed in init) routes each `batch`
+       event into both `search.absorbBatch` and
+       `references.absorbBatch`, filtered by `tag`.
     7. Emit `'file-loaded'` when the decode pass resolves.
   - `reindexRow(serial)` for single-row mutations (edit/delete
-    callsites).
+    callsites). Updates BOTH the search index and the references
+    index in lockstep.
 
 Per-worker startup: `lib/workers/decode-worker.mjs` constructs its own
 `Lz4Service`, awaits `init()`, calls `bindLz4(svc)`, THEN sends the
@@ -165,13 +197,26 @@ sending the first batch — at least one browser dropped pre-eval
 
 Honest blob-text search: `lib/unreal/strings.mjs::collectStrings(decoded)`
 walks the decoded property tree (FName values, StrProperty contents,
-ObjectRef paths + classPaths, SoftObjectRef asset paths, JSON strings)
-and emits `[{path, value}]`. Path syntax: `PropName.SubField[i].key`,
+ObjectRef paths + classPaths, SoftObjectRef asset paths, JSON strings,
+plus string-valued binary structs — Guid / DateTime / Timespan) and
+emits `[{path, value}]`. Path syntax: `PropName.SubField[i].key`,
 with `.class` / `.sub` suffixes for the ObjectRef / SoftObjectRef
 secondary fields. The decode worker turns that into a flat lowercased
 haystack as `manifest.text`. The main thread keeps one entry per
 serial keyed by `actor_serial` and substring-matches the search box
 query against it.
+
+GUIDs in the haystack: every `Guid` struct (ZhuRenGuid / GongHuiGuid /
+SelfUid / JianZhuBuilderUid / …) gets emitted at its property path with
+its canonical uppercase 8-4-4-4-12 hex string as value. FlexSearch
+splits the GUID on `-` into five tokens, so a query like
+`C843A973-AA2D-4A30-A5CF-D529A4CDB028` hits every row containing all
+five (i.e. any row that holds that GUID anywhere). Searching for a
+single segment also works (e.g. `D529A4CDB028`), but a substring that
+straddles a `-` boundary won't — FlexSearch is in `forward` (prefix)
+mode and the dash is a token break, not part of a token. See "Cross-row
+GUID references" below for the offline analyzer that gives you the full
+{serial, path} list per GUID without going through FlexSearch.
 
 End-to-end verified on `world.db` (12,027 rows): node test reports 0
 mismatches, ~113M chars of haystack across all rows, ~2.2× parallel
@@ -209,6 +254,12 @@ js/
                         orchestrator path; refreshRow / dropRow / clear
                         / matches / hasIndex for everyone else.
 
+  references-service.mjs ReferencesService. Same absorbBatch / markDone
+                        / refreshRow / dropRow / clear contract as
+                        SearchService. Query API:
+                        referrersOf / referrersOfRow / selfUidOf /
+                        rowBySelfUid / outboundFrom / stats.
+
   orchestrator.mjs      Orchestrator. Composition root + file-load
                         lifecycle. init() runs the wasm Promise.all,
                         binds lz4, and inits sub-modules.
@@ -245,6 +296,10 @@ lib/unreal/
                         await any more — importing blob.mjs has no
                         side effects.
   strings.mjs           collectStrings(decoded) → [{path, value}].
+  refs.mjs              collectGuids(decoded) → [{path, guid}]. Filters
+                        zero-GUID. Used by the decode worker to
+                        populate manifest.references and by
+                        scripts/find-guid-refs.mjs.
 
 lib/workers/
   pool.mjs              DecodePool. Greedy pull queue, transferable
@@ -274,6 +329,13 @@ test.mjs                Node smoke + perf test. Constructs its own
                         (workers each boot their own). --parallel runs
                         the worker pipeline alongside serial decode and
                         reports haystack stats + a sample row.
+
+scripts/find-guid-refs.mjs
+                        Offline cross-reference analyzer. Decodes every
+                        row, walks each property tree picking out Guid
+                        structs, and prints a {serial, path}-grouped
+                        list of which GUIDs appear in which rows. See
+                        "Cross-row GUID references" below.
 ```
 
 ## Boot model
@@ -312,7 +374,15 @@ Defined in `lib/workers/decode-worker.mjs`.
 { kind: 'unreal-properties' | 'json-wrapped' | 'unknown' | 'empty' | 'error',
   decodeOk: bool,
   error: string | null,
-  references: [],   // ← STILL A STUB. See "Next steps" below.
+  references: [{kind:'guid', guid, path}],
+                    // every Guid struct in the property tree, paired
+                    // with the property path it was found at. Zero-GUID
+                    // (00000000-...) is filtered. Built by
+                    // `collectGuids` from lib/unreal/refs.mjs — shared
+                    // with scripts/find-guid-refs.mjs.
+                    // Future kinds (not yet populated): 'objectref'
+                    // instance suffixes, 'softobj' asset paths,
+                    // 'steam-id'.
   text: string,     // flat lowercased haystack, newline-joined paths+values
   // unreal-properties only:
   terminated?: bool,
@@ -321,6 +391,13 @@ Defined in `lib/workers/decode-worker.mjs`.
   // json-wrapped only:
   parseError?: string | null }
 ```
+
+Stats from `node test.mjs --parallel` on world.db (12,027 rows):
+35,817 GUID refs total, avg 3.0/row, max 132/row, 11,791 rows
+(~98%) carry at least one ref. The wins on top of plain text search:
+the `(serial, path)` pair is preserved so a reverse index can answer
+"who points at this row?" with the originating property name intact —
+something the flat haystack throws away.
 
 ## Property tree renderer
 
@@ -354,29 +431,104 @@ complexity is in type-dispatch + editor widgets, not tree mechanics,
 and a tree library's selection/focus model fights form controls inside
 nodes.
 
+## Cross-row GUID references
+
+`scripts/find-guid-refs.mjs` walks every row of a DB, decodes the blob,
+visits every `Guid` struct in the property tree, and builds a reverse
+index `GUID → [{ serial, name, path }]`. The walker is shared with
+the decode worker — both call `lib/unreal/refs.mjs::collectGuids`, so
+the script's offline output and the live manifest's `references` field
+are guaranteed to agree on what counts as a reference and where the
+property path is.
+
+The zero-GUID `00000000-0000-0000-0000-000000000000` is filtered at the
+walker level — it's the "unset" sentinel and would otherwise dominate
+the cross-ref table with thousands of meaningless matches.
+
+```sh
+node scripts/find-guid-refs.mjs                                  # cross-refs in ./world.db
+node scripts/find-guid-refs.mjs /path/to/other.db                # other DB
+node scripts/find-guid-refs.mjs --guid=C843A973-AA2D-4A30-A5CF-D529A4CDB028
+node scripts/find-guid-refs.mjs --all                            # every GUID, including unique
+node scripts/find-guid-refs.mjs --json                           # JSON; pipes well into jq
+```
+
+Observed relationship patterns (world.db, 12,027 rows / 32,592 distinct
+GUIDs / 509 cross-row GUIDs):
+- An NPC's `ZhuRenGuid` (master/owner) usually equals a player row's
+  `SelfUid` AND that player's `ChuShiKeLongData.ManRenUId` AND their
+  `ControlledPawn` — the player↔NPC ownership/control chain.
+- An NPC's `GongHuiGuid` (guild) equals the guild row's `SelfUid`. NPCs
+  also share their owner-player's `GongHuiGuid` with other NPCs in the
+  same guild.
+- `JianZhuBuilderUid` / `RaftSpaceBuilderUid` link buildings + rafts
+  back to the player who built them.
+- `PeiFangMakingEntry.RequesterID` on workbenches points at the player
+  who queued the recipe.
+
+These patterns are how the planned `references` manifest field (see
+Next Steps #1 below) will eventually populate without needing the full
+property tree on the main thread — the worker just emits the GUID and
+path pairs, and a `ReferencesService` keeps a live reverse-index that
+updates as rows are absorbed.
+
 ## Next steps
 
-1. **`references` is still a STUB.** This is the original cross-row
-   reference extractor the worker pool was built for. Plan:
-   - Pick 3 representative rows from `world.db` and look at their
-     decoded property trees (a player, the player's BindBGCompActor,
-     a chest at adjacent serial−1 of an inventory storage row).
-   - Find the cross-row references — likely candidates:
-     `SoftObjectProperty` / `SoftClassProperty` payloads
-     (`SoftObjectRef.assetPath`), `ObjectProperty` payloads
-     (`ObjectRef.path`, instance suffixes like
-     `BP_FooActor_C_2147481234`), `FName` values that look like asset
-     paths, Steam IDs embedded in player blobs.
-   - Define `references[i]` as `{ kind, target }` and resolve `target`
-     to another `actor_serial` when possible (raw path string fallback).
-   - Extractor lives in `lib/workers/decode-worker.mjs::extractManifest`.
-     Walk recursively into `StructValue.value`, `ArrayValue.elements`,
-     `MapValue.entries`, `ObjectRef.embedded`.
-
-   The decoupled architecture means a second consumer (a
-   ReferencesService or similar) can subscribe to `FactExtractor`'s
-   `batch` events the same way `SearchService` does today —
-   `Orchestrator._installFactForwarding()` is the template.
+1. **GUID cross-references are live in the UI; non-GUID ref kinds are
+   next.** The worker manifest carries
+   `references: [{kind:'guid', guid, path}]` for every Guid struct
+   (zero-GUID filtered). `ReferencesService` consumes these via the
+   same FactExtractor forwarding path as SearchService and answers
+   `referrersOf` / `referrersOfRow` / `selfUidOf` / `rowBySelfUid` /
+   `outboundFrom` in O(1) or O(bucket) time. The UI exposes the index
+   in two places:
+   - **`js/property-tree.mjs`** renders every Guid struct leaf as a
+     jump link (resolved) or muted hex (unresolved — no loaded row
+     claims that SelfUid). `configurePropertyTree({references,
+     onGuidClick})` is called once at app boot; the delegated click
+     handler inside property-tree.mjs invokes `onGuidClick(serial)`,
+     which `app.mjs` wires to `rowTable.setSelection`. The lookup is
+     done at render time so a row indexed AFTER the detail panel
+     opened still renders the older link as unresolved (re-select the
+     row to refresh). Most rows on `world.db` have ~38 resolved + ~48
+     unresolved guid leaves — common for the unresolved bucket to
+     include refs that live in `accounts.db` instead.
+   - **Detail panel "Relationships" section** (rendered by
+     `renderRelationshipsSection` in `app.mjs`). Two subsections:
+       - *Points to* — each outbound guid ref shown as a row of
+         `<path> → #<serial> <row_label>` (or the muted hex when
+         unresolved). Click navigates.
+       - *Pointed to by* — filter buttons keyed by relationship
+         category. Each button calls
+         `rowTable.setRelationshipFilter({label, kind, originSerial,
+         serials})`; the row-table custom search short-circuits on the
+         allow-list before the text/kind/anchor predicates so the
+         filters intersect. A chip appears in the controls bar
+         (`#relationshipChip`) with a × to clear. The chip is
+         auto-cleared on file change / unload / Guid link click.
+   - **Naming convention for the filter buttons** (observed paths in
+     world.db, defined in `REL_PATHS` in `app.mjs`):
+       - *Owned* → `ZhuRenGuid`
+       - *Built* → `JianZhuBuilderUid` or `RaftSpaceBuilderUid`
+       - *Guild* → `GongHuiGuid`
+       - *All*   → every referrer.
+     A button is only rendered when its bucket is non-empty, so a row
+     with no `ZhuRenGuid` referrers won't surface an "Owned NPCs"
+     button.
+   - **Caveats on world.db alone.** Player rows (`SelfUid` = Aleena's
+     GUID) and guild rows live in `accounts.db`. With only `world.db`
+     loaded, NPC ZhuRenGuid/GongHuiGuid refs render unresolved, and
+     "Owned NPCs / Guild members / Built objects" filter buttons are
+     usually empty because the OWNER's SelfUid isn't a loaded row to
+     select-from. The richer queries become available once the UI
+     supports merging accounts.db + world.db into one logical row
+     set; left for later.
+   - **Additional reference kinds** (next slice). `ObjectProperty`
+     instance suffixes (`BP_FooActor_C_2147481234`), `SoftObjectRef`
+     asset paths, Steam IDs embedded in player blobs. Add new
+     `kind:` tags at the walker layer (extend `lib/unreal/refs.mjs`)
+     and parallel indices inside `ReferencesService` — both consumers
+     subscribe to the same FactExtractor batches.
 
 2. **Per-leaf editing in the property tree.** See "Property tree
    renderer" above. The plan is: `propertyEditors` registry → render
@@ -503,6 +655,8 @@ npm test                                 # serial decode, all 12k rows
 node test.mjs --parallel                 # serial + parallel + speedup
 node test.mjs --parallel=4               # override pool size
 node test.mjs /path/to/other.db          # other database file
+node scripts/find-guid-refs.mjs          # cross-row GUID references in world.db
+node scripts/find-guid-refs.mjs --guid=…  # all rows holding a specific GUID
 npm start                                # build + wrangler dev (browser)
 npm run start-dev                        # start + dev-fileserver on :7777
 ```

@@ -43,6 +43,7 @@ import {
   lz4Decompress, lz4Compress, OUTER_VERSION_TAG,
 } from '../lib/unreal/blob.mjs';
 import { collectStrings } from '../lib/unreal/strings.mjs';
+import { collectGuids }   from '../lib/unreal/refs.mjs';
 import { codecJson }      from './codec-json.mjs';
 import { codecs as defaultCodecs, createRegistry } from './codecs.mjs';
 import { DecodePool }     from '../lib/workers/pool.mjs';
@@ -50,6 +51,7 @@ import { Lz4Service }                    from '../lib/lz4-wasm/lz4-service.mjs';
 import { FactExtractor }                 from '../lib/workers/fact-extractor.mjs';
 import { SqliteService, DatabaseHandle } from './sqlite-service.mjs';
 import { SearchService }                 from './search-service.mjs';
+import { ReferencesService }             from './references-service.mjs';
 import { Orchestrator }                  from './orchestrator.mjs';
 import { DataService }                   from './data-service.mjs';
 import { RowTable }                      from './row-table.mjs';
@@ -81,6 +83,7 @@ Object.assign(root.SMDB.unreal, {
   OUTER_VERSION_TAG,
   codec: unrealCodec,
   collectStrings,
+  collectGuids,
 });
 
 root.SMDB.codecJson             = codecJson;
@@ -90,14 +93,15 @@ root.SMDB.createCodecRegistry   = createRegistry;
 root.SMDB.DecodePool            = DecodePool;
 
 // ── Service classes (for direct instantiation if needed) ───────────────────
-root.SMDB.Lz4Service     = Lz4Service;
-root.SMDB.SqliteService  = SqliteService;
-root.SMDB.DatabaseHandle = DatabaseHandle;
-root.SMDB.FactExtractor  = FactExtractor;
-root.SMDB.SearchService  = SearchService;
-root.SMDB.Orchestrator   = Orchestrator;
-root.SMDB.DataService    = DataService;
-root.SMDB.RowTable       = RowTable;
+root.SMDB.Lz4Service        = Lz4Service;
+root.SMDB.SqliteService     = SqliteService;
+root.SMDB.DatabaseHandle    = DatabaseHandle;
+root.SMDB.FactExtractor     = FactExtractor;
+root.SMDB.SearchService     = SearchService;
+root.SMDB.ReferencesService = ReferencesService;
+root.SMDB.Orchestrator      = Orchestrator;
+root.SMDB.DataService       = DataService;
+root.SMDB.RowTable          = RowTable;
 
 // ── i18n / classify / steam / stash / partials ─────────────────────────────
 // Shimmed onto SMDB.* so existing call sites (app.mjs, partials' render
@@ -116,20 +120,25 @@ root.SMDB_LOCALES  = { en, zh };
 // ── Construct service singletons (no async work in constructors) ───────────
 // Constructors only set up internal state. The wasm boots and DOM wiring
 // happen inside orchestrator.init() below.
-const lz4Service     = new Lz4Service();
-const sqliteService  = new SqliteService();
-const factExtractor  = new FactExtractor();
-const searchService  = new SearchService({
+const lz4Service        = new Lz4Service();
+const sqliteService     = new SqliteService();
+const factExtractor     = new FactExtractor();
+const searchService     = new SearchService({
   codecs: defaultCodecs,
   collectStrings,
 });
-const dataService    = new DataService();
-const rowTable       = new RowTable();
-const orchestrator   = new Orchestrator({
+const referencesService = new ReferencesService({
+  codecs: defaultCodecs,
+  collectGuids,
+});
+const dataService       = new DataService();
+const rowTable          = new RowTable();
+const orchestrator      = new Orchestrator({
   lz4:           lz4Service,
   sqlite:        sqliteService,
   factExtractor,
   search:        searchService,
+  references:    referencesService,
   data:          dataService,
   rowTable,
   classify,
@@ -145,6 +154,7 @@ root.SMDB.sqliteService = sqliteService;
 root.SMDB.factExtractor = factExtractor;
 root.SMDB.workerService = factExtractor;
 root.SMDB.search        = searchService;
+root.SMDB.references    = referencesService;
 root.SMDB.data          = dataService;
 root.SMDB.rowTable      = rowTable;
 root.SMDB.orchestrator  = orchestrator;

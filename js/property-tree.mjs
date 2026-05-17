@@ -41,6 +41,19 @@ import { STRUCT_HANDLERS } from '../lib/unreal/structs.mjs';
 
 const t = (k, opts) => i18n.t(k, opts);
 
+// Optional dependencies injected once at app boot via configurePropertyTree.
+// `references` lets Guid struct leaves render as resolved jump links; without
+// it, GUIDs render as plain monospace strings (the renderer stays usable in
+// any context that doesn't have a loaded DB, e.g. tests). `onGuidClick(serial)`
+// is called when the user clicks a resolved GUID — app.mjs wires it to
+// rowTable.setSelection.
+let _references  = null;
+let _onGuidClick = null;
+export function configurePropertyTree({ references = null, onGuidClick = null } = {}) {
+  _references  = references;
+  _onGuidClick = onGuidClick;
+}
+
 // `<details>` at a depth shallower than this open by default. Anything
 // deeper renders closed; the user clicks to drill in. Picked empirically
 // — most actor blobs surface their interesting fields at depth 0–1, and
@@ -75,21 +88,32 @@ function installDelegate() {
   _delegateInstalled = true;
   // Delegate from document so we don't care which container the tree
   // lives in. Idempotent — installDelegate short-circuits on subsequent
-  // renderPropertyTree calls.
+  // renderPropertyTree calls. Handles two click targets:
+  //   .show-more-link  → materialize stashed collection tail
+  //   .prop-guid.resolved → jump to the row whose SelfUid is this guid
   document.addEventListener('click', (e) => {
-    const link = e.target.closest && e.target.closest('.show-more-link');
-    if (!link) return;
-    e.preventDefault();
-    const row = link.closest('.prop-show-more');
-    if (!row) return;
-    const id = row.dataset.stash;
-    const renderFn = _lazyStash.get(id);
-    if (!renderFn) { row.remove(); return; }
-    _lazyStash.delete(id);
-    // outerHTML replacement: lets the new rows (which may themselves
-    // contain show-more links for further-truncated nested collections)
-    // splice into the same depth/padding position the placeholder held.
-    row.outerHTML = renderFn();
+    if (!e.target.closest) return;
+    const showMore = e.target.closest('.show-more-link');
+    if (showMore) {
+      e.preventDefault();
+      const row = showMore.closest('.prop-show-more');
+      if (!row) return;
+      const id = row.dataset.stash;
+      const renderFn = _lazyStash.get(id);
+      if (!renderFn) { row.remove(); return; }
+      _lazyStash.delete(id);
+      // outerHTML replacement: lets the new rows (which may themselves
+      // contain show-more links for further-truncated nested collections)
+      // splice into the same depth/padding position the placeholder held.
+      row.outerHTML = renderFn();
+      return;
+    }
+    const guidLink = e.target.closest('.prop-guid.resolved');
+    if (guidLink) {
+      e.preventDefault();
+      const serial = parseInt(guidLink.dataset.serial, 10);
+      if (Number.isFinite(serial) && _onGuidClick) _onGuidClick(serial);
+    }
   });
 }
 
@@ -248,11 +272,46 @@ function renderValue(tag, value, depth) {
   }
 }
 
+/**
+ * Render a Guid string as a clickable jump link when the configured
+ * ReferencesService knows about a row whose `SelfUid` matches it;
+ * otherwise render it as a plain monospace value (no link) and mark
+ * the leaf as unresolved so styling can call it out as muted.
+ *
+ * The delegated click handler in `installDelegate` reads `data-serial`
+ * off the resolved link and calls `_onGuidClick(serial)`.
+ */
+function renderGuidValue(guid) {
+  const target = _references ? _references.rowBySelfUid(guid) : null;
+  if (target != null) {
+    const titleStr = t('ui.guid.jumpTo', {
+      serial: target,
+      default: 'Jump to row #{serial}',
+    });
+    return `<a href="#" class="prop-guid resolved" `
+      + `data-guid="${escapeAttr(guid)}" data-serial="${target}" `
+      + `title="${escapeAttr(titleStr)}">`
+      + `<code>${escapeText(guid)}</code>`
+      + ` <span class="muted">→ #${target}</span></a>`;
+  }
+  const unresolvedTitle = _references
+    ? t('ui.guid.notLoaded', { default: 'No loaded row claims this SelfUid' })
+    : '';
+  const titleAttr = unresolvedTitle ? ` title="${escapeAttr(unresolvedTitle)}"` : '';
+  return `<code class="prop-guid unresolved" data-guid="${escapeAttr(guid)}"${titleAttr}>`
+    + `${escapeText(guid)}</code>`;
+}
+
 function renderStructValue(sv, depth) {
   if (!sv) return leaf(`<span class="muted">${escapeText(t('ui.tree.emptyStruct'))}</span>`);
   const name = sv._structName;
-  // Known-binary struct: render compactly.
+  // Known-binary struct: render compactly. Guid is special-cased into a
+  // jump link when a ReferencesService is configured — every GUID is a
+  // potential pointer to another row's `SelfUid`.
   if (STRUCT_HANDLERS[name]) {
+    if (name === 'Guid' && typeof sv.value === 'string') {
+      return leaf(`= ${renderGuidValue(sv.value)}`);
+    }
     return leaf(`= <code>${escapeText(JSON.stringify(sv.value))}</code>`);
   }
   if (sv._structDecodeError) {

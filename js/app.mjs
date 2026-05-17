@@ -10,7 +10,7 @@
  */
 
 import { escapeText, escapeAttr, fmtBytes } from './util.mjs';
-import { renderPropertyTree } from './property-tree.mjs';
+import { renderPropertyTree, configurePropertyTree } from './property-tree.mjs';
 
 // ============================================================
 // SHARED RENDER HELPERS
@@ -59,7 +59,22 @@ const setStatus = msg => { $('status').textContent = msg || ''; };
 // and RowTable with their dependencies), and dynamically imported this
 // module. So by the time we run, SMDB.orchestrator / SMDB.data /
 // SMDB.rowTable are fully wired and we only need to attach UI listeners.
-const rowTable = SMDB.rowTable;
+const rowTable   = SMDB.rowTable;
+const references = SMDB.references;
+
+// Wire GUID jump links inside the property tree to row-table navigation.
+// Configured once at boot; the tree consults `references.rowBySelfUid`
+// at render time to decide which leaves are jumpable, and the delegated
+// click handler inside property-tree.mjs invokes onGuidClick on hit.
+// Clear any active relationship filter on jump so the target row is
+// guaranteed to render after the navigation.
+configurePropertyTree({
+  references,
+  onGuidClick: (serial) => {
+    rowTable.clearRelationshipFilter();
+    rowTable.setSelection(serial);
+  },
+});
 
 // Shorthand for the rest of this file. Always returns the *current*
 // handle (or null), so callers automatically see the new DB after a
@@ -259,6 +274,8 @@ function renderDetail(row, summary) {
 
     ${postFieldsHtml}
 
+    ${renderRelationshipsSection(row.actor_serial)}
+
     <div class="detail-section">
       <h3>${escapeText(t('ui.detail.blobHeading', { size: fmtBytes(blobLen), codec: decoded ? decoded.kind : t('ui.detail.blobNone') }))}</h3>
       ${blobHtml}
@@ -270,7 +287,151 @@ function renderDetail(row, summary) {
   SMDB.partials.sectionsFor(row, decoded, 'preFields') .forEach(p => p.wire && p.wire(ctx));
   SMDB.partials.sectionsFor(row, decoded, 'postFields').forEach(p => p.wire && p.wire(ctx));
 
+  wireRelationships(row.actor_serial);
   wireDetailEditing(row, summary, decoded);
+}
+
+// Property paths that surface as the four named relationship filters.
+// `built` is a multi-path category — Soulmask uses different builder fields
+// for buildings (JianZhuBuilderUid) and ships/rafts (RaftSpaceBuilderUid).
+// Add new path names here when we learn about more relationship types.
+const REL_PATHS = {
+  owned: ['ZhuRenGuid'],
+  built: ['JianZhuBuilderUid', 'RaftSpaceBuilderUid'],
+  guild: ['GongHuiGuid'],
+};
+
+function classifyReferrers(referrers) {
+  const buckets = { all: referrers, owned: [], built: [], guild: [] };
+  const builtSet = new Set(REL_PATHS.built);
+  for (const r of referrers) {
+    if (REL_PATHS.owned.includes(r.path)) buckets.owned.push(r);
+    else if (builtSet.has(r.path))        buckets.built.push(r);
+    else if (REL_PATHS.guild.includes(r.path)) buckets.guild.push(r);
+  }
+  return buckets;
+}
+
+/**
+ * Build the Relationships detail section for the given row.
+ *
+ *   Points to     — outbound GUID refs, each rendered as a jump link
+ *                   (or muted if the target isn't in the loaded set).
+ *   Pointed to by — filter buttons that constrain the table to inbound
+ *                   refs, broken down by relationship type.
+ *
+ * Returns the empty string when the row has no SelfUid AND no outbound
+ * refs — nothing useful to show.
+ */
+function renderRelationshipsSection(serial) {
+  const outbound  = references.outboundFrom(serial);
+  const selfUid   = references.selfUidOf(serial);
+  const referrers = selfUid ? references.referrersOf(selfUid) : [];
+
+  if (outbound.length === 0 && referrers.length === 0 && !selfUid) return '';
+
+  const parentRows = outbound.map(o => {
+    const targetRow = o.targetSerial != null ? rowTable.findRow(o.targetSerial) : null;
+    const targetHtml = o.targetSerial != null
+      ? `<a href="#" class="prop-guid resolved" data-serial="${o.targetSerial}">`
+        + `<code>#${o.targetSerial}</code>`
+        + (targetRow ? ` <span class="muted">${escapeText(targetRow._label || '')}</span>` : '')
+        + `</a>`
+      : `<code class="prop-guid unresolved">${escapeText(o.guid)}</code>`
+        + ` <span class="muted">${escapeText(t('ui.relationship.targetMissing'))}</span>`;
+    return `<div class="rel-row">`
+      + `<span class="rel-path">${escapeText(o.path)}</span>`
+      + `<span class="rel-target">${targetHtml}</span>`
+      + `</div>`;
+  }).join('');
+
+  const buckets = classifyReferrers(referrers);
+  const activeFilter = rowTable.relationshipFilter();
+  const activeOrigin = activeFilter && activeFilter.originSerial === serial ? activeFilter.kind : null;
+  // Buttons show the unique row count rather than the entry count — that
+  // matches what the user will see after the filter applies (a referrer
+  // may show up twice on the same row, e.g. a player whose ControlledPawn
+  // AND ChuShiKeLongData.ManRenUId both reference the same NPC). The
+  // filter is keyed by serial, so unique rows is the honest number.
+  const uniq = (entries) => {
+    const s = new Set();
+    for (const e of entries) s.add(e.serial);
+    return s.size;
+  };
+  const btn = (kind, count) => {
+    if (count === 0) return '';
+    const label = t('ui.relationship.btn.' + kind, { count: count.toLocaleString() });
+    const cls   = activeOrigin === kind ? ' class="active"' : '';
+    return `<button data-rel="${kind}"${cls}>${escapeText(label)}</button>`;
+  };
+  const buttonsHtml = referrers.length === 0
+    ? `<div class="muted">${escapeText(t('ui.relationship.noSelfUid'))}</div>`
+    : `<div class="rel-filters">`
+      + btn('all',   uniq(buckets.all))
+      + btn('owned', uniq(buckets.owned))
+      + btn('built', uniq(buckets.built))
+      + btn('guild', uniq(buckets.guild))
+      + `</div>`;
+
+  const parentsHtml = outbound.length === 0
+    ? `<div class="muted">${escapeText(t('ui.relationship.noOutbound'))}</div>`
+    : parentRows;
+
+  return `
+    <div class="detail-section" id="relationshipsSection" data-serial="${serial}">
+      <h3>${escapeText(t('ui.relationship.heading'))}</h3>
+      <div class="muted" style="font-size:11px;">${escapeText(t('ui.relationship.parents'))}</div>
+      ${parentsHtml}
+      <div class="muted" style="font-size:11px; margin-top:8px;">${escapeText(t('ui.relationship.children'))}</div>
+      ${buttonsHtml}
+    </div>`;
+}
+
+/**
+ * Click-wire the Relationships section's buttons and outbound jump links.
+ * Buttons set a row-table relationship filter built from the referrer
+ * bucket they represent; outbound parent links navigate directly.
+ *
+ * Defensive: section may not be rendered for this row (no SelfUid + no
+ * outbound), in which case we no-op.
+ */
+function wireRelationships(serial) {
+  const section = $('relationshipsSection');
+  if (!section) return;
+
+  // Outbound jump links — anchors in the parent rows. Use a section-scoped
+  // listener so we don't fight property-tree.mjs's document-level delegate.
+  section.querySelectorAll('a.prop-guid.resolved').forEach(a => {
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      const target = parseInt(a.dataset.serial, 10);
+      if (!Number.isFinite(target)) return;
+      rowTable.clearRelationshipFilter();
+      rowTable.setSelection(target);
+    });
+  });
+
+  // Relationship filter buttons.
+  section.querySelectorAll('button[data-rel]').forEach(b => {
+    b.addEventListener('click', () => applyRelationshipFilter(serial, b.dataset.rel));
+  });
+}
+
+function applyRelationshipFilter(serial, kind) {
+  const selfUid = references.selfUidOf(serial);
+  if (!selfUid) return;
+  const all = references.referrersOf(selfUid);
+  const buckets = classifyReferrers(all);
+  const refs = buckets[kind] || [];
+  if (refs.length === 0) return;
+  const labelKey = 'ui.relationship.filter' + kind.charAt(0).toUpperCase() + kind.slice(1);
+  const label = t(labelKey, { serial });
+  rowTable.setRelationshipFilter({
+    label,
+    kind,
+    originSerial: serial,
+    serials: refs.map(r => r.serial),
+  });
 }
 
 // Default input element for an editable column when no field partial claims
