@@ -172,6 +172,13 @@ order it deliberately.
   `row-deselected`, `rows-replaced`, `relationship-filter-changed`
   so app.mjs can react without touching the table itself.
 
+  Also exposes `absorbFacts(items)` — called by the orchestrator for
+  each FactExtractor batch. Stamps `row._name` from `deriveName(facts)`
+  for rows whose manifest carries a `facts` object, then debounce-redraws
+  the table. This populates the **Name** column asynchronously after
+  the table first renders. `findRow(serial)` exposes the row object for
+  external lookups (used by `ReferencesService.setKindLookup`).
+
 - **`Orchestrator`** (`js/orchestrator.mjs`). Composition root AND
   file-load lifecycle.
   - `init()` (one-shot):
@@ -183,11 +190,11 @@ order it deliberately.
     3. `await data.init({ sqlite, orchestrator: this })`
     4. `await rowTable.init({ orchestrator: this, search, dataService,
        classify, steam, i18n })`
-    5. Install the FactExtractor → {SearchService, ReferencesService}
-       forwarding listener (filtered by per-load tag so an abandoned
-       load's leftover batches don't pollute the new indices). Each
-       consumer carries its own captured epoch so they can be cleared
-       independently without coordinating across services.
+    5. Install the FactExtractor → {SearchService, ReferencesService,
+       RowTable} forwarding listener (filtered by per-load tag so an
+       abandoned load's leftover batches don't pollute the new indices).
+       Each consumer carries its own captured epoch so they can be
+       cleared independently without coordinating across services.
   - `loadFile(bytes, label)` (per-call, only called by
     `DataService.switchTo`):
     1. `sqlite.open(bytes)` → handle.
@@ -199,8 +206,8 @@ order it deliberately.
        `factExtractor.decode(items, { tag: myLoadId })`. Both consumer
        epochs are captured here.
     6. Forwarding listener (installed in init) routes each `batch`
-       event into both `search.absorbBatch` and
-       `references.absorbBatch`, filtered by `tag`.
+       event into `search.absorbBatch`, `references.absorbBatch`, AND
+       `rowTable.absorbFacts`, filtered by `tag`.
     7. Emit `'file-loaded'` when the decode pass resolves.
   - `reindexRow(serial)` for single-row mutations (edit/delete
     callsites). Updates BOTH the search index and the references
@@ -235,10 +242,15 @@ mode and the dash is a token break, not part of a token. See "Cross-row
 GUID references" below for the offline analyzer that gives you the full
 {serial, path} list per GUID without going through FlexSearch.
 
-End-to-end verified on `world.db` (12,027 rows): node test reports 0
-mismatches, ~113M chars of haystack across all rows, ~2.2× parallel
-speedup. Browser cold-start with a synthetic blob: lz4 round-trips
-through both main-thread codec and worker pool cleanly.
+End-to-end verified on `world.db` (12,027 rows): `node test.mjs`
+reports 0 decode errors; `node test-pool.mjs` reports 12 passed, 0
+failed; ~113M chars of haystack across all rows; ~2.2× parallel
+speedup. TextProperty (FText) decodes correctly for all 41,761
+occurrences. ObjectProperty _sizeMismatch reduced 99.8% (298,225 →
+475 remaining, all ArrayProperty — not affecting name extraction or
+round-trip of any other property type). Key named objects verified:
+serial 17073 "Alfheimr" (portal), 33810 "Alfheimr" (ship engine),
+8213 NPC "Craftsman [Aleena]".
 
 ## Architecture map
 
@@ -304,15 +316,42 @@ lib/unreal/
   io.mjs                Cursor + Writer — no Unreal semantics.
   primitives.mjs        FName + FGuid.
   structs.mjs           STRUCT_HANDLERS + StructValue.
-  values.mjs            ObjectRef + SoftObjectRef + OpaqueValue.
+  values.mjs            ObjectRef + SoftObjectRef + OpaqueValue +
+                        FTextValue. FTextValue wraps decoded FText
+                        (historyType -1 CultureInvariant / 0 Base).
+                        Its `.text` getter returns the best displayable
+                        string (displayString for -1, sourceString for 0).
   properties.mjs        PropertyTag + Property + Array/Set/Map values +
                         readValue / writeValue + property-stream r/w.
+                        TextProperty is fully decoded via readFText()
+                        (no longer an OpaqueValue stub).
+                        ObjectProperty decoding has three Soulmask-
+                        specific fixes: (a) None-trailer skip for
+                        JianZhuInstGLQComponent embedded streams (+4 B
+                        after the None terminator within the sizeHint
+                        budget); (b) kind-only early exit for tagSize=1
+                        null references (prevents path FString reading
+                        into the next property); (c) overshoot detection
+                        after path FString read (OpaqueValue fallback when
+                        the path's SaveNum misreads a '/' byte as a huge
+                        int). These fixes reduced _sizeMismatch cases from
+                        298,225 → 475 (all remaining are ArrayProperty).
   blob.mjs              UnrealBlob (top-level actor_data wrapper) +
                         lz4Decompress / lz4Compress. Backend is bound
                         at boot via bindLz4(service). NO top-level
                         await any more — importing blob.mjs has no
                         side effects.
   strings.mjs           collectStrings(decoded) → [{path, value}].
+                        Handles FTextValue: emits the `.text` string
+                        at the property path so FText content is
+                        indexed in the search haystack.
+  facts.mjs             collectFacts(decoded) → {displayName?,
+                        customNote?, ownerPlayerName?}. Extracts
+                        player-visible names from the property tree:
+                        JianZhuDisplayName (FText), CurGaoShiString
+                        (StrProperty), CustomBeiZhu, OwnerPlayerName.
+                        deriveName(facts) → best single display string:
+                        displayName → "note [owner]" → note → owner.
   refs.mjs              collectGuids(decoded) → [{path, guid}]. Filters
                         zero-GUID. Used by the decode worker to
                         populate manifest.references and by
@@ -324,7 +363,8 @@ lib/workers/
                         handshake before first dispatch.
   decode-worker.mjs     Worker entry. Constructs its own Lz4Service,
                         awaits init(), bindLz4, then announces ready.
-                        Decodes a batch, builds the manifest, returns.
+                        Decodes a batch, builds the manifest (including
+                        the `facts` field via collectFacts), returns.
   fact-extractor.mjs    FactExtractor (was WorkerService). Wraps
                         DecodePool. Events: batch / done / error, each
                         carrying {callId, tag, …}.
@@ -346,6 +386,14 @@ test.mjs                Node smoke + perf test. Constructs its own
                         (workers each boot their own). --parallel runs
                         the worker pipeline alongside serial decode and
                         reports haystack stats + a sample row.
+
+test-pool.mjs           Worker pool integrity + mechanics tests (12
+                        tests, worker-ready handshake, batch delivery,
+                        facts extraction for key serials). Run with
+                        `node test-pool.mjs`.
+test-transfer.mjs       Transfer cost analysis: measures postMessage
+                        overhead for transferable vs non-transferable
+                        payloads at various batch sizes.
 
 scripts/find-guid-refs.mjs
                         Offline cross-reference analyzer. Decodes every
@@ -405,6 +453,14 @@ Defined in `lib/workers/decode-worker.mjs`.
   terminated?: bool,
   bodyTrailingLen?: int,
   topLevelPropertyNames?: string[],
+  facts?: { displayName?: string,   // JianZhuDisplayName (FText) or
+            customNote?: string,    // CurGaoShiString (StrProperty)
+            ownerPlayerName?: string } | null,
+                    // Player-visible names extracted by collectFacts()
+                    // from lib/unreal/facts.mjs. null when no facts
+                    // found. deriveName(facts) collapses these into
+                    // a single display string for the Name column.
+                    // Only present on unreal-properties blobs.
   // json-wrapped only:
   parseError?: string | null }
 ```
@@ -617,7 +673,13 @@ updates as rows are absorbed.
      and parallel indices inside `ReferencesService` — both consumers
      subscribe to the same FactExtractor batches.
 
-2. **Per-leaf editing in the property tree.** See "Property tree
+2. **Property tree renderer: FTextValue support.** `js/property-tree.mjs`
+   currently has no case for `FTextValue` — it falls through to whatever
+   default renders, which likely dumps the raw object. Add a
+   `FTextValue` branch that displays the `.text` string (and optionally
+   the namespace/key for historyType 0 as a muted subtitle).
+
+3. **Per-leaf editing in the property tree.** See "Property tree
    renderer" above. The plan is: `propertyEditors` registry → render
    inputs for leaves of editable types → walk the detail panel for
    dirty inputs → re-build the property tree → `writePropertyStream` →
@@ -626,14 +688,14 @@ updates as rows are absorbed.
    the dirty + save loop end-to-end before tackling collections and
    enums (which also need enum-value metadata for dropdowns).
 
-3. **Mutation / serialize round-trip.** `UnrealBlob.serialize()` still
+4. **Mutation / serialize round-trip.** `UnrealBlob.serialize()` still
    throws when `_dirty` is set. The decoder is solid; the encoder is
    wired but untested for round-trip after edits. The ergonomic step
    is exposing edit helpers on `UnrealBlob` and proving serialize →
    write to sqlite → reload → decode survives a real edit. Prerequisite
    for #2 above.
 
-4. **Worker pool tuning.** Defaults are `size: workerCount-1,
+5. **Worker pool tuning.** Defaults are `size: workerCount-1,
    batchSize: 200`. ~2.2× speedup on the test box with 15 workers;
    postmessage overhead and main-thread buffer-copy time are likely
    capping the ratio. Possible levers: batch more rows (fewer
@@ -641,7 +703,7 @@ updates as rows are absorbed.
    instead of per-row, or look at SharedArrayBuffer (only if
    cross-origin isolation is acceptable).
 
-5. **Empty-state controls bar.** `#controls { display: flex }` in
+6. **Empty-state controls bar.** `#controls { display: flex }` in
    index.html beats the `hidden` attribute that `updateChrome` sets
    when no DB is loaded — so the search / kindFilter / anchor row
    stays visible on the empty page. Pre-existing; a one-line
@@ -649,6 +711,14 @@ updates as rows are absorbed.
    while testing DataService.
 
 ## Known issues / footguns
+
+- **475 remaining `_sizeMismatch` cases on ArrayProperty.** After the
+  ObjectProperty fixes (see `lib/unreal/properties.mjs` notes in the
+  architecture map), 475 mismatches remain — all ArrayProperty elements
+  in `ChengHaoList` (383), `JianZhuInstYuanXings` (62), `DangQianGaiZao`
+  (11), and a few other properties. Cursor recovery (OpaqueValue
+  fallback) still works; these properties just can't round-trip as
+  editable. Not affecting name extraction or the search haystack.
 
 - **TLA + classic defer ordering.** If you add a `<script
   type="module">` that uses top-level await, do not mix it with
@@ -742,6 +812,8 @@ npm test                                 # serial decode, all 12k rows
 node test.mjs --parallel                 # serial + parallel + speedup
 node test.mjs --parallel=4               # override pool size
 node test.mjs /path/to/other.db          # other database file
+node test-pool.mjs                       # worker pool integrity tests (12 tests)
+node test-transfer.mjs                   # transfer cost analysis
 node scripts/find-guid-refs.mjs          # cross-row GUID references in world.db
 node scripts/find-guid-refs.mjs --guid=…  # all rows holding a specific GUID
 npm start                                # build + wrangler dev (browser)
