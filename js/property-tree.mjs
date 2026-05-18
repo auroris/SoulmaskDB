@@ -241,7 +241,7 @@ function renderValue(tag, value, depth) {
     case 'BoolProperty':
       return leaf(`= <code>${value}</code>`);
     case 'StrProperty':
-      return leaf(`= <code>${escapeText(JSON.stringify(value))}</code>`);
+      return renderStrValue(value, depth);
     case 'NameProperty':
       return leaf(`= <code>${escapeText(formatFName(value))}</code>`);
     case 'ObjectProperty': case 'ClassProperty':
@@ -285,6 +285,84 @@ function renderObjectRefValue(value, depth) {
   if (!value.embedded || value.embedded.length === 0) return leaf(pathHtml);
   const inner = value.embedded.map((p, i) => renderPropertyEntry(p, i, depth + 1)).join('');
   return { inline: pathHtml, children: inner };
+}
+
+/**
+ * StrProperty renderer. Soulmask stores several Unreal-side payloads as
+ * JSON-encoded strings inside ordinary StrProperty values — observed
+ * cases include `RelativeTransform` and `HuodongZhongxinLocation`. If
+ * the string parses as a JSON object or array, render it as a
+ * collapsible sub-tree so the embedded structure is readable; otherwise
+ * fall back to the original JSON.stringify display (which escapes
+ * quotes and special chars so the raw string content is unambiguous).
+ *
+ * The decision is name-agnostic — any StrProperty whose value parses
+ * gets the structured view. Round-trip is unaffected: the encoder
+ * writes the row's original string verbatim.
+ */
+function renderStrValue(value, depth) {
+  if (typeof value === 'string' && value.length > 0) {
+    const first = value.charCodeAt(0);
+    // Cheap pre-check: only try JSON.parse when the string actually
+    // starts with `{` (0x7B) or `[` (0x5B). Avoids burning cycles on
+    // every normal string value.
+    if (first === 0x7B || first === 0x5B) {
+      try {
+        const parsed = JSON.parse(value);
+        if (parsed !== null && typeof parsed === 'object') {
+          const children = renderJsonValue(parsed, depth + 1);
+          const tag = `<span class="muted">${escapeText(t('ui.tree.parsedJson'))}</span>`;
+          return { inline: tag, children };
+        }
+      } catch { /* fall through to escaped-string view */ }
+    }
+  }
+  return leaf(`= <code>${escapeText(JSON.stringify(value))}</code>`);
+}
+
+/**
+ * Recursively render a parsed-JSON value (plain JS object / array /
+ * primitive) as property-tree rows. Used by renderStrValue to expand
+ * embedded JSON payloads inside StrProperty values.
+ *
+ * Returns the inner HTML — call sites wrap it in `<div class="prop-children">…</div>`
+ * (which `detailsOrLeaf` does via the `children` field).
+ */
+function renderJsonValue(value, depth) {
+  if (Array.isArray(value)) {
+    return value.map((v, i) =>
+      renderJsonChild(`[${i}]`, v, depth),
+    ).join('');
+  }
+  return Object.entries(value).map(([k, v]) =>
+    renderJsonChild(escapeText(k), v, depth),
+  ).join('');
+}
+
+function renderJsonChild(nameHtml, value, depth) {
+  if (value === null) {
+    return renderSyntheticRow(nameHtml, `= <code>null</code>`, '', depth);
+  }
+  const ty = typeof value;
+  if (ty === 'number' || ty === 'boolean') {
+    return renderSyntheticRow(nameHtml, `= <code>${value}</code>`, '', depth);
+  }
+  if (ty === 'string') {
+    return renderSyntheticRow(nameHtml, `= <code>${escapeText(JSON.stringify(value))}</code>`, '', depth);
+  }
+  if (ty === 'object') {
+    // Recurse via renderJsonValue. The synthetic row's inline shows the
+    // shape (array length / object key count) so collapsed nodes still
+    // hint at what's inside.
+    const summary = Array.isArray(value)
+      ? `<span class="muted">[${value.length}]</span>`
+      : `<span class="muted">{${Object.keys(value).length}}</span>`;
+    const children = renderJsonValue(value, depth + 1);
+    return renderSyntheticRow(nameHtml, summary, children, depth);
+  }
+  // Fallback for unexpected types (function, bigint, undefined). Shouldn't
+  // happen from JSON.parse output, but cheap to be defensive.
+  return renderSyntheticRow(nameHtml, `= <code>${escapeText(String(value))}</code>`, '', depth);
 }
 
 /**

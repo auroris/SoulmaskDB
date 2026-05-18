@@ -203,6 +203,7 @@ export const en = {
   'ui.tree.entries':                '{{count} entries}',
   'ui.tree.sizeMismatchTitle':      'reader and tag.Size disagree',
   'ui.tree.showMore':               '… show {count} more',
+  'ui.tree.parsedJson':             '(parsed JSON)',
 
   // ------------------------------------------------------------- stash dialog
   'ui.stash.heading':               'Row stash',

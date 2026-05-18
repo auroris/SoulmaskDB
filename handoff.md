@@ -135,6 +135,31 @@ order it deliberately.
   without a row table, the lookup is null and every row falls back
   to `SelfUid` (which is fine for the NPC-only spot checks).
 
+  Nested identity: some rows own a list of inline sub-entities whose
+  GUIDs aren't references to other top-level rows but are sub-IDs
+  living inside the parent's blob. The canonical case is a ship /
+  raft / built structure whose `MapHoldJianZhuList[*].value.JianZhuIndicator.JianZhuUid`
+  entries are the IDs of attached deck pieces, walls, slopes etc.
+  A populated ship can hold 500+ of these. Treated as ordinary
+  outbound refs they'd flood the row's "Points to" panel with that
+  many unresolved entries.
+
+  `NESTED_IDENTITY_PATTERNS` (regex array next to `IDENTITY_PATH_BY_KIND`)
+  registers those paths. At absorb time, matching entries get
+  stamped `isNestedIdentity: true` on their `_guidIndex` bucket
+  entry, are tracked per-row in `_nestedIdentitiesByRow`, and are
+  routed into `_rowBySelfUid` (so any OTHER row that references one
+  of these sub-IDs still resolves back to this parent ship). They
+  are NOT added to `_outboundByRow` (so the "Points to" panel
+  ignores them) and NOT added to `_selfUidByRow` (a row still has
+  exactly one primary identity). `referrersOf` filters both
+  `isIdentity` and `isNestedIdentity` so a referrer query never
+  surfaces a row's own sub-IDs as inbound pointers. `_rowBySelfUid`
+  writes for nested identities defer to any existing primary
+  identity entry; nested writes use a "don't clobber" guard.
+  Add new patterns here when more inline-sub-entity conventions
+  surface.
+
   Query API: `referrersOf(guid)`, `referrersOfRow(serial)`,
   `selfUidOf(serial)`, `rowBySelfUid(guid)`, `outboundFrom(serial)`
   (returns `[{guid, path, targetSerial}]` with the target resolved).
@@ -558,6 +583,18 @@ two perf affordances baked in:
   recursively — so 1000-element arrays chunk into nested show-more
   links and each click reveals the next 50. Revisit if that ever feels
   worse than one big expansion.
+
+**StrProperty JSON detection.** Soulmask sometimes stores Unreal-side
+payloads as JSON-encoded strings inside ordinary `StrProperty` values
+— observed cases include `RelativeTransform` and
+`HuodongZhongxinLocation`. `renderStrValue` cheaply pre-checks the
+first byte for `{` (0x7B) / `[` (0x5B) and tries `JSON.parse`; on
+success it expands the parsed object/array as a collapsible sub-tree
+via `renderJsonValue` + `renderJsonChild`. Failed parses fall back to
+the original `JSON.stringify(value)` view (escaped quotes, raw chars
+visible). The decision is name-agnostic — any StrProperty whose value
+parses gets the structured view. Round-trip is unaffected; the encoder
+writes the row's original string verbatim.
 
 The next planned addition is per-leaf editing (textbox / dropdown /
 combo per Unreal type). This needs a `propertyEditors` registry

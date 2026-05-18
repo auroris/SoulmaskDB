@@ -352,6 +352,11 @@ if (parallelEnabled) {
   const serviceUnion = new Set([
     ...refsSvc._outboundByRow.keys(),
     ...refsSvc._selfUidByRow.keys(),
+    // Nested-identity-only rows (e.g. ships whose 561 MapHoldJianZhuList
+    // GUIDs are now classified as inline sub-identities) wouldn't appear
+    // in the prior two maps. Include them so the coverage check still
+    // matches `manifestsWithRefs`.
+    ...refsSvc._nestedIdentitiesByRow.keys(),
   ]);
   const coverageMismatch = serviceUnion.size !== manifestsWithRefs;
   console.log(`  Coverage:        ${serviceUnion.size}/${manifestsWithRefs} ${coverageMismatch ? '— MISMATCH' : '(ok)'}`);

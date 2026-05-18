@@ -16,20 +16,32 @@
  *     SearchService.
  *
  * State (built incrementally as batches land):
- *   _guidIndex      Map<guid, [{serial, path}]>
+ *   _guidIndex              Map<guid, [{serial, path, isIdentity, isNestedIdentity}]>
  *                   every property occurrence of `guid` across all
- *                   rows. Includes the row's own `SelfUid` entry —
- *                   we filter it out at the query layer so callers
- *                   don't have to.
- *   _outboundByRow  Map<serial, [{guid, path}]>
- *                   per-row outbound refs (SelfUid excluded — that's
- *                   identity, not a reference).
- *   _selfUidByRow   Map<serial, guid>
- *                   each row's identity guid (where the walker
- *                   emitted a `path === 'SelfUid'` entry).
- *   _rowBySelfUid   Map<guid, serial>
- *                   reverse of the above. Lets `outboundFrom` resolve
- *                   an outbound ref to a concrete target row in O(1).
+ *                   rows. Includes the row's own primary-identity
+ *                   entry and any nested-identity entries (see
+ *                   NESTED_IDENTITY_PATTERNS below) — both are
+ *                   filtered out at the query layer so callers don't
+ *                   have to.
+ *   _outboundByRow          Map<serial, [{guid, path}]>
+ *                   per-row outbound refs. Primary identity and
+ *                   nested identities are excluded — they're "I am
+ *                   this guid" / "I contain this guid inline", not
+ *                   references TO it.
+ *   _selfUidByRow           Map<serial, guid>
+ *                   each row's PRIMARY identity guid (per
+ *                   IDENTITY_PATH_BY_KIND). One per row.
+ *   _rowBySelfUid           Map<guid, serial>
+ *                   reverse lookup: which row claims this guid as
+ *                   either its primary identity OR a nested identity.
+ *                   Primary identities win on collision; nested-
+ *                   identity writes don't clobber an existing entry.
+ *   _nestedIdentitiesByRow  Map<serial, [{guid, path}]>
+ *                   per-row sub-entity identity entries — GUIDs the
+ *                   row owns inline (deck pieces of a ship, etc.)
+ *                   rather than referencing externally. Tracked so
+ *                   `_removeRow` can clean them up from `_guidIndex`
+ *                   and `_rowBySelfUid` without scanning every bucket.
  *
  * Query API:
  *   referrersOf(guid)      → [{serial, path}]
@@ -91,6 +103,43 @@ const IDENTITY_PATH_BY_KIND = {
 };
 const DEFAULT_IDENTITY_PATH = 'SelfUid';
 
+/**
+ * Nested-identity path patterns. These are paths whose `Guid` value is the
+ * identity of a sub-entity that lives inline inside a parent row's blob
+ * (no standalone `actor_table` row of its own). For row 12583 (a ship) the
+ * 561 `MapHoldJianZhuList[N].value.JianZhuIndicator.JianZhuUid` GUIDs are
+ * the identities of deck pieces / walls / slopes built into the ship.
+ *
+ * Without this list those GUIDs would flow into `_outboundByRow` as
+ * outbound references — every one of them rendering as "(target not in
+ * loaded set)" in the Relationships panel — and would also pollute
+ * `referrersOf` results when other rows happen to mention the same guid.
+ *
+ * Matching path entries are:
+ *   - excluded from the row's `_outboundByRow` list (they aren't
+ *     references TO something else; they ARE this row's sub-identities)
+ *   - registered in `_rowBySelfUid` so any OTHER row that references one
+ *     of these sub-entity GUIDs resolves back to this parent row
+ *   - excluded from `referrersOf` (a sub-identity isn't a referrer either)
+ *   - NOT placed in `_selfUidByRow` (that map holds the row's PRIMARY
+ *     identity; a row can only have one of those)
+ *
+ * Add patterns here when more nested-identity conventions are discovered.
+ * The regex must match against the full property path string emitted by
+ * `lib/unreal/refs.mjs::collectGuids` (e.g.
+ * `JianZhuInstGLQComponent.MapHoldJianZhuList[419].value.JianZhuIndicator.JianZhuUid`).
+ */
+const NESTED_IDENTITY_PATTERNS = [
+  /(?:^|\.)MapHoldJianZhuList\[\d+\]\.value\.JianZhuIndicator\.JianZhuUid$/,
+];
+
+function isNestedIdentityPath(path) {
+  for (const re of NESTED_IDENTITY_PATTERNS) {
+    if (re.test(path)) return true;
+  }
+  return false;
+}
+
 export class ReferencesService {
   /**
    * @param {object} options
@@ -110,10 +159,16 @@ export class ReferencesService {
     this._collectGuids = collectGuids;
     this._kindLookup   = kindLookup;
 
-    this._guidIndex     = new Map();
-    this._outboundByRow = new Map();
-    this._selfUidByRow  = new Map();
-    this._rowBySelfUid  = new Map();
+    this._guidIndex             = new Map();
+    this._outboundByRow         = new Map();
+    this._selfUidByRow          = new Map();
+    this._rowBySelfUid          = new Map();
+    // Per-row list of nested-identity entries (sub-entity GUIDs the row
+    // owns inline — see NESTED_IDENTITY_PATTERNS). Tracked separately
+    // from _outboundByRow because they are NOT references; the per-row
+    // bookkeeping is what lets `_removeRow` clean them up without
+    // scanning every `_guidIndex` bucket.
+    this._nestedIdentitiesByRow = new Map();
 
     this._totalRefs = 0;
     this._listeners = new Set();
@@ -205,6 +260,7 @@ export class ReferencesService {
     this._outboundByRow.clear();
     this._selfUidByRow.clear();
     this._rowBySelfUid.clear();
+    this._nestedIdentitiesByRow.clear();
     this._totalRefs = 0;
     this._emit('reset', null);
   }
@@ -224,7 +280,8 @@ export class ReferencesService {
     if (!bucket) return [];
     const out = [];
     for (const entry of bucket) {
-      if (!entry.isIdentity) out.push({ serial: entry.serial, path: entry.path });
+      if (entry.isIdentity || entry.isNestedIdentity) continue;
+      out.push({ serial: entry.serial, path: entry.path });
     }
     return out;
   }
@@ -291,7 +348,9 @@ export class ReferencesService {
 
   _absorbOne(serial, references) {
     // Idempotent — strip any prior entries for this serial first.
-    if (this._outboundByRow.has(serial) || this._selfUidByRow.has(serial)) {
+    if (this._outboundByRow.has(serial)
+        || this._selfUidByRow.has(serial)
+        || this._nestedIdentitiesByRow.has(serial)) {
       this._removeRow(serial);
     }
     if (!Array.isArray(references) || references.length === 0) return;
@@ -299,18 +358,21 @@ export class ReferencesService {
     const identityPath = this._identityPathFor(serial);
 
     let outbound = null;
+    let nested   = null;
     for (const ref of references) {
       if (ref.kind !== 'guid' || !ref.guid) continue;
-      const isIdentity = ref.path === identityPath;
+      const isIdentity       = ref.path === identityPath;
+      const isNestedIdentity = !isIdentity && isNestedIdentityPath(ref.path);
 
       let bucket = this._guidIndex.get(ref.guid);
       if (!bucket) { bucket = []; this._guidIndex.set(ref.guid, bucket); }
-      // Stamp isIdentity on the bucket entry so `referrersOf` can filter
-      // without re-consulting `_kindLookup` per query — the row's kind is
-      // resolved once at absorb time. (If a row's kind ever changes after
-      // it's been absorbed, we'd need to re-absorb it; for now kinds are
-      // immutable per load.)
-      bucket.push({ serial, path: ref.path, isIdentity });
+      // Stamp isIdentity / isNestedIdentity on the bucket entry so
+      // `referrersOf` can filter without re-consulting `_kindLookup`
+      // or `isNestedIdentityPath` per query — both are resolved once
+      // at absorb time. (If a row's kind or the nested-identity
+      // patterns change after a row's been absorbed, we'd need to
+      // re-absorb it; for now both are immutable per load.)
+      bucket.push({ serial, path: ref.path, isIdentity, isNestedIdentity });
       this._totalRefs++;
 
       if (isIdentity) {
@@ -320,12 +382,30 @@ export class ReferencesService {
         // becomes the rowBySelfUid target. _guidIndex still has both
         // entries so referrersOf surfaces nothing surprising.
         this._rowBySelfUid.set(ref.guid, serial);
+      } else if (isNestedIdentity) {
+        // Sub-entity identity living inline in this row's blob. Register
+        // it in _rowBySelfUid so refs from OTHER rows resolve back here,
+        // but do NOT touch _selfUidByRow (a row has at most one primary
+        // identity, and this isn't it) and do NOT add to outbound (it
+        // isn't a reference, it's an inline identity).
+        if (!nested) nested = [];
+        nested.push({ guid: ref.guid, path: ref.path });
+        // Don't overwrite an existing _rowBySelfUid mapping — if a row
+        // somewhere already claims this guid as its PRIMARY identity,
+        // that mapping wins. (Practically this hasn't been observed,
+        // but it's the same conservative posture _absorbOne uses for
+        // primary-identity collisions: prefer earlier writers when we
+        // can tell them apart by intent.)
+        if (!this._rowBySelfUid.has(ref.guid)) {
+          this._rowBySelfUid.set(ref.guid, serial);
+        }
       } else {
         if (!outbound) outbound = [];
         outbound.push({ guid: ref.guid, path: ref.path });
       }
     }
     if (outbound) this._outboundByRow.set(serial, outbound);
+    if (nested)   this._nestedIdentitiesByRow.set(serial, nested);
   }
 
   _removeRow(serial) {
@@ -333,6 +413,20 @@ export class ReferencesService {
     if (outbound) {
       for (const { guid } of outbound) this._dropFromBucket(guid, serial);
       this._outboundByRow.delete(serial);
+    }
+    const nested = this._nestedIdentitiesByRow.get(serial);
+    if (nested) {
+      for (const { guid } of nested) {
+        this._dropFromBucket(guid, serial);
+        // Only clear the reverse mapping if it still points at THIS
+        // serial (another row's primary identity may have claimed it
+        // since, or another nested-identity write may have skipped past
+        // ours under the "don't overwrite" guard in _absorbOne).
+        if (this._rowBySelfUid.get(guid) === serial) {
+          this._rowBySelfUid.delete(guid);
+        }
+      }
+      this._nestedIdentitiesByRow.delete(serial);
     }
     const selfUid = this._selfUidByRow.get(serial);
     if (selfUid != null) {
