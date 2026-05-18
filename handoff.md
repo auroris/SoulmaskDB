@@ -246,11 +246,14 @@ End-to-end verified on `world.db` (12,027 rows): `node test.mjs`
 reports 0 decode errors; `node test-pool.mjs` reports 12 passed, 0
 failed; ~113M chars of haystack across all rows; ~2.2× parallel
 speedup. TextProperty (FText) decodes correctly for all 41,761
-occurrences. ObjectProperty _sizeMismatch reduced 99.8% (298,225 →
-475 remaining, all ArrayProperty — not affecting name extraction or
-round-trip of any other property type). Key named objects verified:
-serial 17073 "Alfheimr" (portal), 33810 "Alfheimr" (ship engine),
-8213 NPC "Craftsman [Aleena]".
+occurrences. ArrayProperty _sizeMismatch reduced to 379 (was 441),
+the 62 `JianZhuInstYuanXings` cases resolved by reading the trailing
+binary section (see "ArrayProperty<ObjectProperty> trailing binary"
+below); remaining 379 are `ChengHaoList` (356), `DangQianGaiZao` (5),
+and small tails — those have *negative* gaps (decoder overshoots),
+a different class of bug. Key named objects verified: serial 17073
+"Alfheimr" (portal), 33810 "Alfheimr" (ship engine), 8213 NPC
+"Craftsman [Aleena]".
 
 ## Architecture map
 
@@ -334,8 +337,17 @@ lib/unreal/
                         into the next property); (c) overshoot detection
                         after path FString read (OpaqueValue fallback when
                         the path's SaveNum misreads a '/' byte as a huge
-                        int). These fixes reduced _sizeMismatch cases from
-                        298,225 → 475 (all remaining are ArrayProperty).
+                        int). ArrayProperty<ObjectProperty> values may
+                        carry a packed trailing binary section after the
+                        elements — readObjectArrayTrailing decodes the
+                        self-describing [stride, count, data]* format and
+                        stores the parsed result on
+                        `ArrayValue._trailing` (see
+                        "ArrayProperty<ObjectProperty> trailing binary"
+                        below). Together these fixes reduced
+                        _sizeMismatch cases from 298,225 → 379 (all
+                        remaining are over-reading ArrayProperty cases —
+                        `ChengHaoList` & co.).
   blob.mjs              UnrealBlob (top-level actor_data wrapper) +
                         lz4Decompress / lz4Compress. Backend is bound
                         at boot via bindLz4(service). NO top-level
@@ -710,15 +722,68 @@ updates as rows are absorbed.
    `#controls[hidden] { display: none }` fixes it. Flagged 2026-05-15
    while testing DataService.
 
+## ArrayProperty<ObjectProperty> trailing binary
+
+A Soulmask-specific custom format that lives inside the tag size budget
+of certain `ArrayProperty<ObjectProperty>` values, after the standard
+tagged element data. Discovered while investigating the 62 positive-gap
+`_sizeMismatch` cases on `JianZhuInstYuanXings` (building instance
+prototype lists on boats, rafts, built structures).
+
+Layout (after `numElements` int32 and `numElements` standard
+ObjectProperty elements, within the array tag's `size` budget):
+
+```
+[3 × float32]                 origin (observed always (0,0,0))
+repeated until budget exhausted:
+  [u32 stride]   [u32 count]  section header
+  [count × stride bytes]      packed binary payload
+```
+
+Empirically the sections always come as a triple:
+- **section 0**: `stride=64, count=N` — N world 4×4 transform matrices
+  for placed building pieces. Row-major `FMatrix44`, translation at
+  `floats[12..14]`.
+- **section 1**: `stride=4,  count=N` — N per-piece `u32` IDs.
+- **section 2**: `stride=64, count=M` — M local 4×4 transforms for
+  prototype shapes (typically M = N or N+1).
+
+Decoder lives in `lib/unreal/properties.mjs::readObjectArrayTrailing`
+and stores the parsed result on `ArrayValue._trailing` as
+`{ origin, sections: [{stride, count, data}] }`. If structural checks
+fail (implausible stride, count, or budget-overshoot), it falls back to
+`{ _raw, _parseError }` and the writer emits the raw bytes verbatim so
+byte-identical round-trip still holds. Verified: all 62 affected rows
+parse cleanly (0 raw fallbacks) and the trailing section serializes
+byte-identical via `writeObjectArrayTrailing`.
+
+Renderer (`js/property-tree.mjs::renderArrayTrailing`) appends the
+parsed sections as expandable children after the array's normal
+elements: each `stride=64` item shows its translation inline with the
+full 4×4 matrix as collapsible children; each `stride=4` item shows
+the `u32` value; unknown strides render as hex sample bytes.
+
+The reader gate is intentionally narrow: trailing parsing only kicks
+in for `ArrayProperty<ObjectProperty>` (and the other Object-family
+inner types) where the element decode left a positive remainder within
+`tag.size`. Normal arrays that consume exactly `tag.size` are
+untouched; over-reading arrays (`ChengHaoList` etc.) don't enter this
+path either, since the cursor is already past the budget when we'd
+check. So the change is additive — no existing decode behavior moves.
+
 ## Known issues / footguns
 
-- **475 remaining `_sizeMismatch` cases on ArrayProperty.** After the
-  ObjectProperty fixes (see `lib/unreal/properties.mjs` notes in the
-  architecture map), 475 mismatches remain — all ArrayProperty elements
-  in `ChengHaoList` (383), `JianZhuInstYuanXings` (62), `DangQianGaiZao`
-  (11), and a few other properties. Cursor recovery (OpaqueValue
-  fallback) still works; these properties just can't round-trip as
-  editable. Not affecting name extraction or the search haystack.
+- **379 remaining `_sizeMismatch` cases on ArrayProperty.** These have
+  *negative* gaps — `readArrayElement` for `ObjectProperty` calls
+  `readPropertyStream(cursor)` UNBOUNDED, which overshoots the array
+  tag's size budget when the element's embedded stream doesn't
+  terminate within it. Cursor recovery snaps back to `valueStart +
+  tag.size`, so the outer stream stays consistent, but these properties
+  can't round-trip as editable. Concentrated in `ChengHaoList` (356),
+  `DangQianGaiZao` (5), with smaller tails in `ItemLearnPeiFangList`,
+  `NotUseAppointDaoJus`, etc. Not affecting name extraction or the
+  search haystack. The positive-gap case (`JianZhuInstYuanXings`, 62
+  rows) is now fully decoded — see next section.
 
 - **TLA + classic defer ordering.** If you add a `<script
   type="module">` that uses top-level await, do not mix it with

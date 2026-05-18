@@ -206,12 +206,14 @@ function renderCappedItems(items, renderItem, placedDepth) {
   return visible + renderShowMoreRow(total - COLLECTION_DISPLAY_CAP, stashId, placedDepth);
 }
 
+// Plain-text label — call sites pass the result through escapeText() before
+// dropping it into HTML, so any `<` / `>` here gets encoded exactly once.
 function propertyTypeLabel(tag) {
   const ty = tag.type.value;
   if (ty === 'StructProperty') return `StructProperty (${tag.structName.value})`;
-  if (ty === 'ArrayProperty')  return `ArrayProperty&lt;${tag.innerType.value}&gt;`;
-  if (ty === 'SetProperty')    return `SetProperty&lt;${tag.innerType.value}&gt;`;
-  if (ty === 'MapProperty')    return `MapProperty&lt;${tag.innerType.value}, ${tag.valueType.value}&gt;`;
+  if (ty === 'ArrayProperty')  return `ArrayProperty<${tag.innerType.value}>`;
+  if (ty === 'SetProperty')    return `SetProperty<${tag.innerType.value}>`;
+  if (ty === 'MapProperty')    return `MapProperty<${tag.innerType.value}, ${tag.valueType.value}>`;
   if (ty === 'ByteProperty' && tag.enumName?.value && tag.enumName.value !== 'None') return `ByteProperty (${tag.enumName.value})`;
   if (ty === 'EnumProperty')   return `EnumProperty (${tag.enumName.value})`;
   return ty;
@@ -244,15 +246,10 @@ function renderValue(tag, value, depth) {
       return leaf(`= <code>${escapeText(formatFName(value))}</code>`);
     case 'ObjectProperty': case 'ClassProperty':
     case 'WeakObjectProperty': case 'LazyObjectProperty':
-    case 'WSObjectProperty': {
+    case 'WSObjectProperty':
       // Plain string = just a path; object = path + embedded property stream
       // (Soulmask serializes the referenced object's data inline).
-      if (typeof value === 'string') return leaf(`→ <code>${escapeText(value)}</code>`);
-      const pathHtml = `→ <code>${escapeText(value.path)}</code>`;
-      if (!value.embedded || value.embedded.length === 0) return leaf(pathHtml);
-      const inner = value.embedded.map((p, i) => renderPropertyEntry(p, i, depth + 1)).join('');
-      return { inline: pathHtml, children: inner };
-    }
+      return renderObjectRefValue(value, depth);
     case 'SoftObjectProperty': case 'SoftClassProperty':
       return leaf(`→ <code>${escapeText(value.assetPath)}${value.subPath ? ':' + escapeText(value.subPath) : ''}</code>`);
     case 'ByteProperty':
@@ -274,6 +271,20 @@ function renderValue(tag, value, depth) {
     default:
       return leaf(`<span class="muted">${escapeText(t('ui.tree.value', { type: propType }))}</span>`);
   }
+}
+
+// ObjectProperty / ClassProperty / WeakObjectProperty / LazyObjectProperty / WSObjectProperty.
+// Shared between the top-level renderValue case and renderArrayValue's per-element renderer
+// (array-of-ObjectProperty inner types like JianZhuInstYuanXings).
+function renderObjectRefValue(value, depth) {
+  if (value && value._opaque) {
+    return leaf(`<span class="muted">${escapeText(t('ui.tree.opaque', { bytes: value._opaque.length, reason: value._opaqueReason || '?' }))}</span>`);
+  }
+  if (typeof value === 'string') return leaf(`→ <code>${escapeText(value)}</code>`);
+  const pathHtml = `→ <code>${escapeText(value.path || '')}</code>`;
+  if (!value.embedded || value.embedded.length === 0) return leaf(pathHtml);
+  const inner = value.embedded.map((p, i) => renderPropertyEntry(p, i, depth + 1)).join('');
+  return { inline: pathHtml, children: inner };
 }
 
 /**
@@ -329,27 +340,110 @@ function renderStructValue(sv, depth) {
 }
 
 function renderArrayValue(tag, value, depth) {
-  if (!value || !value.elements || value.elements.length === 0) {
+  const hasElements = value && value.elements && value.elements.length > 0;
+  const hasTrailing = value && value._trailing;
+  if (!hasElements && !hasTrailing) {
     return leaf(`<span class="muted">[]</span>`);
   }
   const innerType = tag.innerType.value;
   // Show inline if elements are tiny primitives and the array is small.
-  const isShortPrim = value.elements.length <= 8 && ['IntProperty','FloatProperty','BoolProperty','NameProperty','StrProperty'].includes(innerType);
+  const isShortPrim = hasElements && !hasTrailing && value.elements.length <= 8
+    && ['IntProperty','FloatProperty','BoolProperty','NameProperty','StrProperty'].includes(innerType);
   if (isShortPrim) {
     return leaf(`= <code>${escapeText(JSON.stringify(value.elements.map(stringifyForInline)))}</code>`);
   }
   const childDepth = depth + 1;
+  const isObjType = innerType === 'ObjectProperty' || innerType === 'ClassProperty'
+    || innerType === 'WeakObjectProperty' || innerType === 'LazyObjectProperty'
+    || innerType === 'WSObjectProperty';
   const renderItem = (e, i) => {
     if (innerType === 'StructProperty') {
       const { inline, children } = renderStructValue(e, childDepth);
       return renderSyntheticRow(`[${i}]`, inline, children, childDepth);
     }
+    if (isObjType) {
+      const { inline, children } = renderObjectRefValue(e, childDepth);
+      return renderSyntheticRow(`[${i}]`, inline, children, childDepth);
+    }
     return renderSyntheticRow(`[${i}]`, `= <code>${escapeText(stringifyForInline(e))}</code>`, '', childDepth);
   };
-  return {
-    inline: `<span class="muted">${escapeText(t('ui.tree.items', { count: value.elements.length }))}</span>`,
-    children: renderCappedItems(value.elements, renderItem, childDepth),
-  };
+  let children = hasElements ? renderCappedItems(value.elements, renderItem, childDepth) : '';
+  let inlineExtra = '';
+  if (hasTrailing) {
+    children += renderArrayTrailing(value._trailing, childDepth);
+    if (value._trailing._raw) {
+      inlineExtra = ` <span class="muted">+ trailing ${value._trailing._raw.length} B raw</span>`;
+    } else {
+      const counts = value._trailing.sections.map(s => s.count).join('/');
+      inlineExtra = ` <span class="muted">+ trailing (${counts})</span>`;
+    }
+  }
+  const inline = hasElements
+    ? `<span class="muted">${escapeText(t('ui.tree.items', { count: value.elements.length }))}</span>${inlineExtra}`
+    : `<span class="muted">[]</span>${inlineExtra}`;
+  return { inline, children };
+}
+
+// Render the Soulmask trailing binary for ArrayProperty<ObjectProperty>:
+//   origin (Vector) + N self-describing sections (stride/count/data).
+// See readObjectArrayTrailing in lib/unreal/properties.mjs for the format.
+function renderArrayTrailing(trailing, depth) {
+  if (trailing._raw) {
+    const inline = `<span class="muted">${trailing._raw.length} B raw — parse failed: ${escapeText(trailing._parseError || '?')}</span>`;
+    return renderSyntheticRow(`<span class="muted">trailing</span>`, inline, '', depth);
+  }
+  const parts = [];
+  const { x, y, z } = trailing.origin;
+  if (x !== 0 || y !== 0 || z !== 0) {
+    parts.push(renderSyntheticRow('origin', `= <code>(${x.toFixed(3)}, ${y.toFixed(3)}, ${z.toFixed(3)})</code>`, '', depth + 1));
+  }
+  for (let i = 0; i < trailing.sections.length; i++) {
+    parts.push(renderTrailingSection(trailing.sections[i], i, depth + 1));
+  }
+  const counts = trailing.sections.map(s => s.count).join('/');
+  const inline = `<span class="muted">${trailing.sections.length} sections (${counts})</span>`;
+  return renderSyntheticRow(`<span class="muted">trailing</span>`, inline, parts.join(''), depth);
+}
+
+function renderTrailingSection(section, idx, depth) {
+  const { stride, count, data } = section;
+  const childDepth = depth + 1;
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let renderItem, labelKind;
+  if (stride === 64) {
+    // 4×4 FMatrix (row-major). Translation lives at floats[12..14].
+    labelKind = 'transforms';
+    renderItem = (_, i) => {
+      const o = i * 64;
+      const tx = dv.getFloat32(o + 48, true).toFixed(2);
+      const ty = dv.getFloat32(o + 52, true).toFixed(2);
+      const tz = dv.getFloat32(o + 56, true).toFixed(2);
+      const rows = [];
+      for (let r = 0; r < 4; r++) {
+        const cols = [];
+        for (let c = 0; c < 4; c++) cols.push(dv.getFloat32(o + (r*4 + c)*4, true).toPrecision(6));
+        rows.push(renderSyntheticRow(`m[${r}]`, `= <code>(${cols.join(', ')})</code>`, '', childDepth + 1));
+      }
+      const inline = `<span class="muted">trans</span> <code>(${tx}, ${ty}, ${tz})</code>`;
+      return renderSyntheticRow(`[${i}]`, inline, rows.join(''), childDepth);
+    };
+  } else if (stride === 4) {
+    labelKind = 'u32 ids';
+    renderItem = (_, i) => {
+      const v = dv.getUint32(i * 4, true);
+      return renderSyntheticRow(`[${i}]`, `= <code>${v}</code>`, '', childDepth);
+    };
+  } else {
+    labelKind = `stride=${stride}`;
+    renderItem = (_, i) => {
+      const o = i * stride;
+      const sample = Array.from(data.slice(o, o + Math.min(stride, 16))).map(b => b.toString(16).padStart(2,'0')).join(' ');
+      return renderSyntheticRow(`[${i}]`, `<code class="muted">${sample}${stride > 16 ? '…' : ''}</code>`, '', childDepth);
+    };
+  }
+  const items = renderCappedItems(new Array(count).fill(null), renderItem, childDepth);
+  const inline = `<span class="muted">${labelKind} (${count})</span>`;
+  return renderSyntheticRow(`section[${idx}]`, inline, items, depth);
 }
 
 function renderSetValue(_tag, value, depth) {
