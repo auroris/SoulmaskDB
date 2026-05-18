@@ -48,6 +48,12 @@ export default function(eleventyConfig) {
       'lib/datatables.net-colreorder-dt/colReorder.dataTables.mjs',
     'node_modules/datatables.net-colreorder-dt/css/colReorder.dataTables.css':
       'lib/datatables.net-colreorder-dt/colReorder.dataTables.css',
+    'node_modules/datatables.net-rowgroup/js/dataTables.rowGroup.mjs':
+      'lib/datatables.net-rowgroup/dataTables.rowGroup.mjs',
+    'node_modules/datatables.net-rowgroup-dt/js/rowGroup.dataTables.mjs':
+      'lib/datatables.net-rowgroup-dt/rowGroup.dataTables.mjs',
+    'node_modules/datatables.net-rowgroup-dt/css/rowGroup.dataTables.css':
+      'lib/datatables.net-rowgroup-dt/rowGroup.dataTables.css',
     'node_modules/flexsearch/dist/flexsearch.bundle.module.min.mjs':
       'lib/flexsearch/flexsearch.module.mjs',
   });

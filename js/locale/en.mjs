@@ -15,12 +15,8 @@ export const en = {
   // ------------------------------------------------------------- page chrome
   'ui.title':                       'Soulmask world.db browser',
   'ui.header.title':                'SOULMASK world.db',
-  'ui.header.verifyCodec':          'verify codec',
-  'ui.header.verifyCodec.title':    'Round-trip-decode every blob and report failures',
   'ui.header.files':                'files',
   'ui.header.files.title':          'Open the database files dialog',
-  'ui.header.scripts':              'scripts',
-  'ui.header.scripts.title':        "Browse distinct actor_script values and what they classify as",
   'ui.header.steamCache':           'Steam cache ({count})',
   'ui.header.steamCache.title':     'Clear locally cached Steam display names (dev affordance)',
   'ui.header.stash':                'stash ({count})',
@@ -28,6 +24,7 @@ export const en = {
   'ui.header.download':             'Download modified .db',
   'ui.header.changedBadge':         '● unsaved changes',
   'ui.header.language':             'Language',
+  'ui.header.decoding':             'decoding blobs…',
 
   // ----------------------------------------------------------------- filters
   'ui.search.placeholder':          'filter (also searches strings inside blobs)',
@@ -90,6 +87,7 @@ export const en = {
   'ui.tableHeader.serial':          '#',
   'ui.tableHeader.kind':            'kind',
   'ui.tableHeader.name':            'name',
+  'ui.tableHeader.parent':          'parent',
   'ui.tableHeader.class':           'class',
   'ui.tableHeader.summary':         'summary',
   'ui.tableHeader.owner':           'owner',
@@ -97,6 +95,12 @@ export const en = {
   'ui.tableHeader.time':            'time',
   'ui.tableHeader.distance':        'dist',
   'ui.tableEmpty':                  'no rows match',
+
+  // -------------------------------------------------------- focus / row group
+  'ui.focus.selfGroup':             'Selected — #{serial} {label}',
+  'ui.focus.childrenGroup':         'Children of #{serial} {label}',
+  'ui.focus.chipLabel':             'focus: #{serial} {label} ({count} children)',
+  'ui.focus.clear':                 'clear focus',
 
   // ------------------------------------------------------------- pagination
   'ui.pagination.first':            '« first',
@@ -223,30 +227,6 @@ export const en = {
   'ui.stash.confirmClear':          "Delete all {count} stashed rows? This can't be undone (export first if you want a backup).",
   'ui.stash.defaultPlayerLabel':    'Player {id}{suffix}',
   'ui.stash.defaultRowLabel':       '#{serial} {label}',
-
-  // ---------------------------------------------------------- scripts dialog
-  'ui.scripts.heading':             'Scripts in this DB',
-  'ui.scripts.close':                'close',
-  'ui.scripts.unmappedOnly':        "show only unmapped ('other')",
-  'ui.scripts.copyUnmapped':        'copy unmapped to clipboard',
-  'ui.scripts.copiedCount':         'copied {count} unmapped scripts',
-  'ui.scripts.copyFailed':          'copy failed: {message}',
-  'ui.scripts.empty':               '(no scripts match the filter)',
-  'ui.scripts.noScript':            '(no script)',
-  'ui.scripts.summary':             '{distinct} distinct scripts · {unmapped} unmapped',
-  'ui.scripts.headerCount':         '#',
-  'ui.scripts.headerKind':          'kind',
-  'ui.scripts.headerScript':        'actor_script',
-
-  // ------------------------------------------------------------ verify dialog
-  'ui.verify.heading':              'Codec round-trip results',
-  'ui.verify.close':                'close',
-  'ui.verify.running':              'Running…',
-  'ui.verify.loadingBlobs':         'Loading blobs…',
-  'ui.verify.progress':             'Tested {done} / {total}  —  {ok} OK, {fail} fail, {skipped} skipped',
-  'ui.verify.doneHeading':          'Done. {total} blobs tested.',
-  'ui.verify.doneSummary':          '✓ {ok} round-trip OK  ·  ✗ {fail} fail  ·  {skipped} skipped (non-unreal-properties)  ·  {pass}% pass',
-  'ui.verify.moreFailures':         '… {count} more failures not shown',
 
   // -------------------------------------------------------- alerts & prompts
   'ui.alert.notSoulmaskDB':         '{file}: not a Soulmask world.db (no actor_table)',

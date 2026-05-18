@@ -83,11 +83,25 @@ const getDb = () => SMDB.orchestrator.db();
 
 // Surface load errors as alerts. RowTable handles the rows-ready /
 // unloaded paths (it owns the table); we only react to errors here.
+// Also toggle the decode spinner — it spins from `rows-ready` (decode
+// about to start streaming) through `file-loaded` (decode pass done).
+const setDecodeSpinner = (active) => {
+  const el = $('decodeSpinner');
+  if (el) el.classList.toggle('hidden', !active);
+};
 SMDB.orchestrator.addListener((event, data) => {
-  if (event === 'load-error') {
+  if (event === 'rows-ready')        setDecodeSpinner(true);
+  else if (event === 'file-loaded')  setDecodeSpinner(false);
+  else if (event === 'load-error') {
+    setDecodeSpinner(false);
     setStatus('');
     alert(t('ui.alert.notSoulmaskDB', { file: data.label }));
   }
+});
+SMDB.data.addListener((event /*, data */) => {
+  // File removed / replaced — kill any in-flight spinner so the empty
+  // state isn't left spinning forever.
+  if (event === 'unloaded') setDecodeSpinner(false);
 });
 
 // When the active DB is removed, hand the dialog back to the user.
@@ -109,8 +123,10 @@ rowTable.addListener((event, data) => {
     $('main').classList.remove('with-detail');
     updateChrome();
     if (data.label) {
-      setStatus(t('ui.status.loaded',
-        { file: data.label, count: data.rows.length.toLocaleString() }));
+      // The decode-progress spinner in the header (see #decodeSpinner)
+      // replaces the prior "loaded {file} — {count} rows" status line —
+      // it was redundant once the page also surfaces the row count in
+      // the summary bar.
       resolvePlayerNames(data.rows);
     }
   } else if (event === 'row-selected') {
@@ -185,8 +201,6 @@ function markDirty() { dirty = true; updateChrome(); }
 
 function updateChrome() {
   const db = getDb();
-  $('verifyAllBtn').disabled = !db;
-  $('scriptsBtn').disabled = !db;
   $('controls').hidden = !db;
   $('empty').hidden = !!db;
   $('changedBadge').textContent = dirty ? t('ui.header.changedBadge') : '';
@@ -896,153 +910,6 @@ function importStashFile(file) {
 }
 
 // ============================================================
-// CODEC ROUND-TRIP SELF-TEST
-// ============================================================
-
-/**
- * Iterate every actor_data blob, run the unreal-properties codec through
- * decode+encode, and compare to the original. Reports counts and lists
- * failures with serial + tail of the path that broke.
- *
- * Yields control to the browser every batch so the page stays responsive
- * on 12K-row DBs.
- */
-async function runVerifyAll() {
-  const db = getDb();
-  if (!db) return;
-  $('verifyDialog').showModal();
-  $('verifySummary').textContent = t('ui.verify.loadingBlobs');
-  $('verifyFailures').innerHTML = '';
-
-  const rows = [];
-  db.exec({
-    sql: `SELECT actor_serial, actor_script, actor_data
-          FROM actor_table
-          WHERE actor_data IS NOT NULL AND length(actor_data) > 0
-          ORDER BY actor_serial`,
-    rowMode: 'object',
-    resultRows: rows,
-  });
-
-  let ok = 0, fail = 0, skipped = 0;
-  const failures = [];
-  const BATCH = 200;
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i];
-    const codec = SMDB.codecs.detect(r.actor_data);
-    if (!codec || codec.name !== 'unreal-properties') { skipped++; continue; }
-    const res = SMDB.codecUnrealProperties.verifyRoundTrip(r.actor_data);
-    if (res.ok) ok++;
-    else {
-      fail++;
-      failures.push({ serial: r.actor_serial, script: r.actor_script, reason: res.reason });
-    }
-    if (i % BATCH === 0) {
-      $('verifySummary').innerHTML = t('ui.verify.progress', {
-        done:    i.toLocaleString(),
-        total:   rows.length.toLocaleString(),
-        ok:      `<span style="color:var(--ok);">${ok}</span>`,
-        fail:    `<span class="danger">${fail}</span>`,
-        skipped,
-      });
-      await new Promise(r => setTimeout(r, 0));
-    }
-  }
-
-  const passRate = rows.length > 0 ? ((ok / (ok + fail || 1)) * 100).toFixed(2) : '0';
-  const summaryHtml = t('ui.verify.doneSummary', {
-    ok:      `<span style="color:var(--ok);">✓ ${ok.toLocaleString()}</span>`,
-    fail:    `<span class="danger">✗ ${fail.toLocaleString()}</span>`,
-    skipped: skipped.toLocaleString(),
-    pass:    passRate,
-  });
-  $('verifySummary').innerHTML = `
-    <div style="margin-bottom:6px;"><strong>${escapeText(t('ui.verify.doneHeading', { total: rows.length.toLocaleString() }))}</strong></div>
-    <div>${summaryHtml}</div>`;
-
-  // Show first 200 failures grouped by root-cause-ish prefix.
-  const shown = failures.slice(0, 200);
-  const moreCount = failures.length - shown.length;
-  $('verifyFailures').innerHTML = shown.map(f => `
-    <div class="verify-fail">
-      <span class="ser">#${f.serial}</span>
-      <span class="muted">${escapeText((f.script || '').replace(/.*[./]/, '').replace(/_C$/, ''))}</span>
-      <div class="reason">${escapeText(f.reason)}</div>
-    </div>`).join('') + (moreCount > 0 ? `<div class="muted" style="padding:8px 14px;">${escapeText(t('ui.verify.moreFailures', { count: moreCount }))}</div>` : '');
-}
-
-// ============================================================
-// SCRIPTS DIAGNOSTIC
-// ============================================================
-//
-// Browse distinct actor_script values in the loaded DB, see which kind
-// each maps to, and copy the ones still landing in 'other' back as input
-// for new rules in SMDB.classify.RULES.
-
-let scriptsUnmappedOnly = false;
-
-function openScriptsDialog() {
-  if (!getDb()) return;
-  scriptsUnmappedOnly = $('scriptsFilterUnmapped').checked;
-  renderScriptsList();
-  $('scriptsDialog').showModal();
-}
-
-function renderScriptsList() {
-  const all = SMDB.classify.aggregateScripts(rowTable.rows());
-  const unmappedCount = all.filter(s => s.kind === 'other').length;
-  const shown = (scriptsUnmappedOnly ? all.filter(s => s.kind === 'other') : all)
-    .slice()
-    .sort((a, b) => {
-      // 'other' first within the current view, then count desc.
-      if ((a.kind === 'other') !== (b.kind === 'other')) return a.kind === 'other' ? -1 : 1;
-      return b.count - a.count;
-    });
-
-  $('scriptsSummary').textContent = t('ui.scripts.summary', {
-    distinct: all.length.toLocaleString(),
-    unmapped: unmappedCount.toLocaleString(),
-  });
-  $('scriptsCopyUnmapped').disabled = unmappedCount === 0;
-
-  const body = $('scriptsList');
-  if (shown.length === 0) {
-    body.innerHTML = `<div class="muted" style="padding:20px; text-align:center;">${escapeText(t('ui.scripts.empty'))}</div>`;
-    return;
-  }
-  body.innerHTML = `
-    <table>
-      <thead><tr>
-        <th style="text-align:right;">${escapeText(t('ui.scripts.headerCount'))}</th>
-        <th>${escapeText(t('ui.scripts.headerKind'))}</th>
-        <th>${escapeText(t('ui.scripts.headerScript'))}</th>
-      </tr></thead>
-      <tbody>${shown.map(s => `
-        <tr>
-          <td class="count">${s.count.toLocaleString()}</td>
-          <td class="kind"><span class="pill ${s.kind}">${escapeText(t('ui.kind.' + s.kind, { default: s.kind }))}</span></td>
-          <td>${escapeText(s.script || t('ui.scripts.noScript'))}</td>
-        </tr>`).join('')}
-      </tbody>
-    </table>`;
-}
-
-async function copyUnmappedScripts() {
-  const all = SMDB.classify.aggregateScripts(rowTable.rows());
-  const unmapped = all.filter(s => s.kind === 'other').sort((a, b) => b.count - a.count);
-  if (unmapped.length === 0) return;
-  // Plain text, "<count>\t<script>" per line — readable and machine-parseable.
-  const text = unmapped.map(s => `${s.count}\t${s.script}`).join('\n');
-  try {
-    await navigator.clipboard.writeText(text);
-    $('scriptsCopyStatus').textContent = t('ui.scripts.copiedCount', { count: unmapped.length });
-  } catch (e) {
-    $('scriptsCopyStatus').textContent = t('ui.scripts.copyFailed', { message: e.message });
-  }
-  setTimeout(() => { $('scriptsCopyStatus').textContent = ''; }, 4000);
-}
-
-// ============================================================
 // WIRE-UP
 // ============================================================
 
@@ -1063,23 +930,12 @@ SMDB.search.addListener((event, data) => {
         { count: `${data.indexed.toLocaleString()} / ${data.total.toLocaleString()}` }));
     }
   } else if (event === 'done') {
-    if (currentFileLabel) {
-      setStatus(t('ui.status.loaded',
-        { file: currentFileLabel, count: rowTable.count().toLocaleString() }));
-    }
+    // Clear the indexing-progress status; the spinner in the header
+    // is the canonical "still working" signal, and the loaded-summary
+    // line has been retired (the summary bar already shows row count).
+    setStatus('');
   }
 });
-
-$('verifyAllBtn').addEventListener('click', runVerifyAll);
-$('verifyClose').addEventListener('click', () => $('verifyDialog').close());
-
-$('scriptsBtn').addEventListener('click', openScriptsDialog);
-$('scriptsClose').addEventListener('click', () => $('scriptsDialog').close());
-$('scriptsFilterUnmapped').addEventListener('change', () => {
-  scriptsUnmappedOnly = $('scriptsFilterUnmapped').checked;
-  renderScriptsList();
-});
-$('scriptsCopyUnmapped').addEventListener('click', copyUnmappedScripts);
 
 $('stashBtn').addEventListener('click', openStash);
 $('stashClose').addEventListener('click', () => $('stashDialog').close());

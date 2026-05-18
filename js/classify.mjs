@@ -212,34 +212,6 @@ export const classify = (() => {
     return { kind, label: cls, summary: translateIdent(cls) + pos + facing };
   }
 
-  // Group an array of classified rows by actor_script. For each distinct
-  // script, returns { script, count, kind, sampleLabel }. The kind is the
-  // dominant _kind for that script (almost always uniform, since classify
-  // is deterministic per script). sampleLabel is the _label from one of
-  // the rows — handy when the script path alone is opaque.
-  function aggregateScripts(rows) {
-    const stats = new Map();
-    for (const r of rows) {
-      const script = r.actor_script == null ? '' : r.actor_script;
-      let s = stats.get(script);
-      if (!s) {
-        s = { script, count: 0, kindCounts: {}, sampleLabel: r._label || '' };
-        stats.set(script, s);
-      }
-      s.count++;
-      s.kindCounts[r._kind] = (s.kindCounts[r._kind] || 0) + 1;
-    }
-    const out = [];
-    for (const s of stats.values()) {
-      let bestKind = 'other', bestCount = -1;
-      for (const [k, c] of Object.entries(s.kindCounts)) {
-        if (c > bestCount) { bestKind = k; bestCount = c; }
-      }
-      out.push({ script: s.script, count: s.count, kind: bestKind, sampleLabel: s.sampleLabel });
-    }
-    return out;
-  }
-
   // ===========================================================
   // Parent/child relationships
   // ===========================================================
@@ -329,7 +301,6 @@ export const classify = (() => {
     isPlayerRow, isSystemRow,
     shortClassName, parseTransform, translateIdent,
     bearingFromTransform, distanceMeters,
-    aggregateScripts,
     findRelations, isInventoryStorageRow, isInventoryOwnerRow,
     SCRIPT, NAME, RULES,
   };

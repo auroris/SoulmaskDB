@@ -179,6 +179,48 @@ order it deliberately.
   the table first renders. `findRow(serial)` exposes the row object for
   external lookups (used by `ReferencesService.setKindLookup`).
 
+  Pairs with `absorbParents(items)` — also called per FactExtractor
+  batch, AFTER `references.absorbBatch` so the references service is
+  current for the items in question. Stamps `row._parent` via
+  `_deriveParent(serial)`, which consults `references.outboundFrom` and
+  picks the first resolvable target from the priority list
+  `ZhuRenGuid` → `JianZhuBuilderUid` / `RaftSpaceBuilderUid` →
+  `GongHuiGuid`. This populates the **Parent** column asynchronously
+  (same pattern as Name) and feeds focus mode's children-of-X lookup.
+
+  **Focus mode.** Engaged on every `setSelection(serial)`. Filters the
+  visible table to {selected ∪ rows with `_parent === selected`} via the
+  custom search predicate, pins the selected row at the top via a
+  hidden `_focusOrder` column (0 for selected, 1 for children) ordered
+  ascending, and groups the children under a "Children of #N" header
+  via DataTables RowGroup keyed on a synthetic `_focusGroup` string
+  field. `clearSelection()` disengages — RowGroup disabled, order
+  restored, `_focusGroup` cleared. A controls-bar chip `#focusChip`
+  shows the active focus and × to clear. Parents may stream in AFTER
+  the user has engaged focus, so `absorbParents` extends the focus set
+  on the fly when a freshly-stamped row's `_parent` matches the active
+  focus serial.
+
+  **Parent column click.** Each Parent cell renders as
+  `<a class="parent-link">` carrying `data-serial`. A delegated click
+  handler on tbody navigates to the parent serial (which itself
+  re-engages focus mode on that parent — selection IS focus). The
+  click handler `stopPropagation`s so the row's own click doesn't also
+  fire.
+
+- **`HistoryService`** (`js/history-service.mjs`). Single-purpose bridge
+  between RowTable selection and the browser history stack. Subscribes
+  to `row-selected` / `row-deselected` / `rows-replaced` on RowTable and
+  writes `?row=<serial>` into the URL (via `history.pushState` on every
+  selection, `replaceState` on the first push of a session, and a clean
+  no-row URL when the file changes). Listens for `popstate` and drives
+  `rowTable.setSelection(serial)` / `clearSelection()` accordingly, with
+  a `_suppress` flag so the resulting selection event doesn't re-push
+  into history. Deep-linking is intentionally off — the URL is updated
+  during the session for back/forward use only, and `?row=N` on first
+  load is ignored (no row exists yet at boot anyway). Wired by
+  `bootstrap.mjs` after `orchestrator.init()` finishes.
+
 - **`Orchestrator`** (`js/orchestrator.mjs`). Composition root AND
   file-load lifecycle.
   - `init()` (one-shot):
@@ -244,16 +286,13 @@ GUID references" below for the offline analyzer that gives you the full
 
 End-to-end verified on `world.db` (12,027 rows): `node test.mjs`
 reports 0 decode errors; `node test-pool.mjs` reports 12 passed, 0
-failed; ~113M chars of haystack across all rows; ~2.2× parallel
+failed; `node test-roundtrip.mjs` reports 11,667 / 11,667 rows pass
+byte-identical at 174.6 MB of verified bytes (zero `_sizeMismatch`
+remaining); ~113M chars of haystack across all rows; ~2.2× parallel
 speedup. TextProperty (FText) decodes correctly for all 41,761
-occurrences. ArrayProperty _sizeMismatch reduced to 379 (was 441),
-the 62 `JianZhuInstYuanXings` cases resolved by reading the trailing
-binary section (see "ArrayProperty<ObjectProperty> trailing binary"
-below); remaining 379 are `ChengHaoList` (356), `DangQianGaiZao` (5),
-and small tails — those have *negative* gaps (decoder overshoots),
-a different class of bug. Key named objects verified: serial 17073
-"Alfheimr" (portal), 33810 "Alfheimr" (ship engine), 8213 NPC
-"Craftsman [Aleena]".
+occurrences. Key named objects verified: serial 17073 "Alfheimr"
+(portal), 33810 "Alfheimr" (ship engine), 8213 NPC "Craftsman
+[Aleena]".
 
 ## Architecture map
 
@@ -301,8 +340,19 @@ js/
                         init({sqlite, orchestrator}) wires deps.
 
   row-table.mjs         RowTable. Constructor is parameterless;
-                        init({orchestrator, search, dataService,
-                        classify, steam, i18n}) wires deps.
+                        init({orchestrator, search, references,
+                        dataService, classify, steam, i18n}) wires
+                        deps. Owns the parent column (`_parent` field),
+                        focus mode (filter + RowGroup keyed on a
+                        synthetic `_focusGroup` field, ordered by a
+                        hidden `_focusOrder` numeric column), and the
+                        `#focusChip` controls-bar chip.
+
+  history-service.mjs   HistoryService. Bridges RowTable selection
+                        events ↔ window.history. pushState on row
+                        selection (?row=N), popstate → setSelection /
+                        clearSelection. Suppression flag prevents the
+                        popstate-triggered selection from re-pushing.
 
   classify.mjs          classify(row) → {kind, label, summary};
                         parseTransform, distanceMeters, etc.
@@ -326,28 +376,25 @@ lib/unreal/
                         string (displayString for -1, sourceString for 0).
   properties.mjs        PropertyTag + Property + Array/Set/Map values +
                         readValue / writeValue + property-stream r/w.
-                        TextProperty is fully decoded via readFText()
-                        (no longer an OpaqueValue stub).
-                        ObjectProperty decoding has three Soulmask-
-                        specific fixes: (a) None-trailer skip for
-                        JianZhuInstGLQComponent embedded streams (+4 B
-                        after the None terminator within the sizeHint
-                        budget); (b) kind-only early exit for tagSize=1
-                        null references (prevents path FString reading
-                        into the next property); (c) overshoot detection
-                        after path FString read (OpaqueValue fallback when
-                        the path's SaveNum misreads a '/' byte as a huge
-                        int). ArrayProperty<ObjectProperty> values may
-                        carry a packed trailing binary section after the
-                        elements — readObjectArrayTrailing decodes the
-                        self-describing [stride, count, data]* format and
-                        stores the parsed result on
+                        Encoder is byte-identical round-trip across all
+                        of world.db; see "Encoder round-trip notes"
+                        below for the six wire-form invariants that
+                        have to be preserved. TextProperty is fully
+                        decoded via readFText() (no longer an
+                        OpaqueValue stub). ObjectProperty values
+                        respect their size budget at top level
+                        (readObjectValue) and inside arrays
+                        (readArrayElement now takes a sizeHint),
+                        matching the variable wire shape (kind-only,
+                        +path, +path+classPath, or +embedded stream)
+                        without overshooting. ArrayProperty<ObjectProperty>
+                        values may carry a packed trailing binary
+                        section after the elements — readObjectArrayTrailing
+                        decodes the self-describing [stride, count, data]*
+                        format and stores the parsed result on
                         `ArrayValue._trailing` (see
                         "ArrayProperty<ObjectProperty> trailing binary"
-                        below). Together these fixes reduced
-                        _sizeMismatch cases from 298,225 → 379 (all
-                        remaining are over-reading ArrayProperty cases —
-                        `ChengHaoList` & co.).
+                        below).
   blob.mjs              UnrealBlob (top-level actor_data wrapper) +
                         lz4Decompress / lz4Compress. Backend is bound
                         at boot via bindLz4(service). NO top-level
@@ -403,6 +450,13 @@ test-pool.mjs           Worker pool integrity + mechanics tests (12
                         tests, worker-ready handshake, batch delivery,
                         facts extraction for key serials). Run with
                         `node test-pool.mjs`.
+test-roundtrip.mjs      Decode → re-encode → byte-compare for every
+                        row in world.db. Skips lz4 (not byte-stable);
+                        otherwise verifies the property-stream encoder
+                        byte-for-byte. Current baseline: 11,667 / 11,667
+                        rows pass at 174.6 MB of verified bytes — zero
+                        skipped, zero failures. Exits 1 on any
+                        unexpected failure.
 test-transfer.mjs       Transfer cost analysis: measures postMessage
                         overhead for transferable vs non-transferable
                         payloads at various batch sizes.
@@ -701,11 +755,13 @@ updates as rows are absorbed.
    enums (which also need enum-value metadata for dropdowns).
 
 4. **Mutation / serialize round-trip.** `UnrealBlob.serialize()` still
-   throws when `_dirty` is set. The decoder is solid; the encoder is
-   wired but untested for round-trip after edits. The ergonomic step
-   is exposing edit helpers on `UnrealBlob` and proving serialize →
-   write to sqlite → reload → decode survives a real edit. Prerequisite
-   for #2 above.
+   throws when `_dirty` is set, but the underlying encoder is now
+   verified byte-identical for EVERY row in `world.db`
+   (`node test-roundtrip.mjs` — 11,667 / 11,667 pass at 174.6 MB of
+   verified bytes, zero skipped, zero failures). The ergonomic step
+   now is exposing edit helpers on `UnrealBlob` and flipping the
+   `_dirty` gate to actually re-encode through `writePropertyStream` +
+   `lz4Compress` — the serialize pipeline below it is sound.
 
 5. **Worker pool tuning.** Defaults are `size: workerCount-1,
    batchSize: 200`. ~2.2× speedup on the test box with 15 workers;
@@ -721,6 +777,78 @@ updates as rows are absorbed.
    stays visible on the empty page. Pre-existing; a one-line
    `#controls[hidden] { display: none }` fixes it. Flagged 2026-05-15
    while testing DataService.
+
+## Encoder round-trip notes
+
+`writePropertyStream` is the canonical serializer. `test-roundtrip.mjs`
+verifies byte-identical decode → encode for every row in `world.db`
+(11,667 / 11,667 pass, 174.6 MB of bytes verified). Six sharp edges
+have to be respected for that round-trip to hold — each surfaced as a
+multi-thousand-row regression in the round-trip test before being fixed:
+
+1. **`OpaqueValue` fallback can land in any property slot.** Decode may
+   fall back to `OpaqueValue` for Array/Set/Map/Struct/Text/Object values
+   whose structured decode threw. `writeValue` checks for `OpaqueValue`
+   up-front and emits the captured bytes verbatim — every per-type writer
+   assumes its specific value shape and would crash dereferencing fields
+   like `value.elements.length`.
+
+2. **`ObjectRef.path` and `.classPath` are wire-absent vs wire-empty.**
+   A kind-only ObjectProperty value (`tag.size === 1`) has NO FString on
+   the wire at all — distinct from an FString with `SaveNum=0` (null
+   form, 4 B) or `SaveNum=1` (empty-with-terminator, 5 B). `ObjectRef`
+   uses `null` to mean "not on wire" and tracks `_pathIsNull` /
+   `_classPathIsNull` to preserve the SaveNum=0 vs SaveNum=1 distinction
+   for empty fields that WERE on the wire. The writer skips the FString
+   entirely when the field is `null`. Without this, every kind-only
+   reference inflated by 4 B per encode.
+
+3. **Embedded ObjectProperty's 4-byte FName.Number trailer must be
+   replayed.** Some Soulmask nested ObjectProperty streams (e.g.
+   `JianZhuInstGLQComponent`) carry the outermost-stream None-trailer
+   convention: 4 bytes of `FName.Number = 0` after the embedded stream's
+   None FString. `readObjectValue` detects this when exactly 4 bytes
+   remain in the tag's size budget and sets
+   `ObjectRef.hasTerminatorTrailer = true`; `ObjectRef.write` passes the
+   flag through to `writeNestedPropertyStream` so the trailer is emitted.
+
+4. **`FTextValue` empty-FString sub-fields preserve the wire's
+   null-vs-empty-with-terminator form.** Same SaveNum=0 vs SaveNum=1
+   distinction as ObjectRef, applied to `namespace` / `key` /
+   `sourceString` (historyType=0) and `displayString` (historyType=-1).
+   Per-field `_*IsNull` flags are captured on read and forwarded to
+   `writeFString` on write.
+
+5. **ArrayProperty<ObjectProperty> elements need a sizeHint.** Inner
+   ObjectProperty elements have variable shapes (kind-only, +path,
+   +path+classPath, +full embedded stream) and no per-element delimiter.
+   Without a budget, the element greedily reads all four fields and
+   overruns into the next property's tag — the cursor goes off the rails
+   and the cursor-snap can't recover the row (cf. `ChengHaoList` with
+   `numElements=1` and a kind+path-only element). `readArrayValue`
+   computes a per-element budget (`(remainingBudget) / numElementsLeft`)
+   and passes it to `readArrayElement`, which mirrors `readObjectValue`'s
+   bounded early-exit logic. `writeArrayElement` no longer forces
+   `requireClassPath: true` — the writer respects whatever the read
+   captured.
+
+6. **Known-binary structs can appear as TAGGED property streams.**
+   Inside Map struct values, Soulmask sometimes serializes
+   `Transform` / `Box` / `Sphere` / etc. as a tagged stream of named
+   sub-properties (e.g. `Rotation:Quat`, `Translation:Vector`,
+   `Scale3D:Vector`) rather than as the raw 40-byte (or N-byte) record
+   the binary handler expects. `StructValue.read` accepts an optional
+   `peekFn` callback (the same `peekLooksLikePropertyTag` heuristic used
+   for Map struct-value discrimination); when the wire looks tagged,
+   the read switches to the property-stream path even when a handler
+   exists. The decision is recorded implicitly: `value` is an object
+   for handler-path reads, an array of `Property` for stream-path
+   reads. `StructValue.write` dispatches on `Array.isArray(value)`, so
+   the same struct can round-trip either way without explicit metadata.
+
+For all six, `null` vs `''` semantics and value-shape matter — don't
+normalize them away in helper layers (i18n, search index, etc.) or
+you'll re-introduce the byte drift.
 
 ## ArrayProperty<ObjectProperty> trailing binary
 
@@ -773,17 +901,11 @@ check. So the change is additive — no existing decode behavior moves.
 
 ## Known issues / footguns
 
-- **379 remaining `_sizeMismatch` cases on ArrayProperty.** These have
-  *negative* gaps — `readArrayElement` for `ObjectProperty` calls
-  `readPropertyStream(cursor)` UNBOUNDED, which overshoots the array
-  tag's size budget when the element's embedded stream doesn't
-  terminate within it. Cursor recovery snaps back to `valueStart +
-  tag.size`, so the outer stream stays consistent, but these properties
-  can't round-trip as editable. Concentrated in `ChengHaoList` (356),
-  `DangQianGaiZao` (5), with smaller tails in `ItemLearnPeiFangList`,
-  `NotUseAppointDaoJus`, etc. Not affecting name extraction or the
-  search haystack. The positive-gap case (`JianZhuInstYuanXings`, 62
-  rows) is now fully decoded — see next section.
+- **No remaining `_sizeMismatch` cases** in `world.db` after the
+  ChengHaoList / RelativeTransform / JianZhuInstYuanXings work. Every
+  row round-trips byte-identically through the encoder. If new save
+  files surface new mismatches, `test-roundtrip.mjs` will flag them
+  immediately (it exits non-zero on any unexpected failure).
 
 - **TLA + classic defer ordering.** If you add a `<script
   type="module">` that uses top-level await, do not mix it with
@@ -878,6 +1000,7 @@ node test.mjs --parallel                 # serial + parallel + speedup
 node test.mjs --parallel=4               # override pool size
 node test.mjs /path/to/other.db          # other database file
 node test-pool.mjs                       # worker pool integrity tests (12 tests)
+node test-roundtrip.mjs                  # decode → encode → byte-compare every row
 node test-transfer.mjs                   # transfer cost analysis
 node scripts/find-guid-refs.mjs          # cross-row GUID references in world.db
 node scripts/find-guid-refs.mjs --guid=…  # all rows holding a specific GUID

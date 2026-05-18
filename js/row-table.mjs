@@ -49,8 +49,21 @@ import DataTable from 'datatables.net-dt';
 // columns left/right via dt.colReorder.move().
 import 'datatables.net-columncontrol-dt';
 import 'datatables.net-colreorder-dt';
+import 'datatables.net-rowgroup-dt';
 import { escapeText, escapeAttr, debounce, fmtBytes } from './util.mjs';
 import { deriveName } from '../lib/unreal/facts.mjs';
+
+// Property paths that count as a "parent" link from a child row up to
+// its owner. Priority order: ownership beats build-by beats guild.
+// Mirrors REL_PATHS in app.mjs (which classifies the inverse — referrers
+// of a given row). Kept here so the table can stamp `_parent` without
+// reaching into app.mjs.
+const PARENT_PATHS_PRIORITY = [
+  ['ZhuRenGuid'],
+  ['JianZhuBuilderUid', 'RaftSpaceBuilderUid'],
+  ['GongHuiGuid'],
+];
+const PARENT_PATHS_FLAT = new Set(PARENT_PATHS_PRIORITY.flat());
 
 // Register a plain-text search content type with ColumnControl. The
 // stock `searchText` always renders an operator <select> ("Contains",
@@ -94,12 +107,13 @@ export class RowTable {
   constructor({ tableId = 'rowsTable' } = {}) {
     this._tableId  = tableId;
 
-    this._orch     = null;
-    this._search   = null;
-    this._classify = null;
-    this._steam    = null;
-    this._i18n     = null;
-    this._data     = null;
+    this._orch       = null;
+    this._search     = null;
+    this._references = null;
+    this._classify   = null;
+    this._steam      = null;
+    this._i18n       = null;
+    this._data       = null;
 
     this._allRows = [];
     this._currentFileLabel = null;
@@ -122,6 +136,14 @@ export class RowTable {
     // column's ColumnControl `searchList` to match — the column dropdown
     // and the pill row stay in step.
     this._selectedKinds = new Set();
+
+    // Focus mode — engaged on every setSelection(serial). When active,
+    // the table shows ONLY the focused row + its direct children (rows
+    // whose `_parent` resolves to this serial), with the focused row
+    // pinned at the top and the children grouped underneath via DT's
+    // RowGroup. `clearSelection` disengages.
+    this._focusSerial = null;
+    this._focusSet    = new Set();
 
     this._listeners = new Set();
     this._dtApi     = null;
@@ -147,21 +169,23 @@ export class RowTable {
    * @param {object}        deps.steam        isSteamId64 / displayName
    * @param {object}        deps.i18n         { t(key, opts?) }
    */
-  async init({ orchestrator, search, dataService, classify, steam, i18n } = {}) {
+  async init({ orchestrator, search, references, dataService, classify, steam, i18n } = {}) {
     if (this._initialized) return;
     if (!orchestrator) throw new Error('RowTable.init: orchestrator is required');
     if (!search)       throw new Error('RowTable.init: search is required');
+    if (!references)   throw new Error('RowTable.init: references is required');
     if (!classify)     throw new Error('RowTable.init: classify is required');
     if (!steam)        throw new Error('RowTable.init: steam is required');
     if (!i18n)         throw new Error('RowTable.init: i18n is required');
     if (!dataService)  throw new Error('RowTable.init: dataService is required');
 
-    this._orch     = orchestrator;
-    this._search   = search;
-    this._classify = classify;
-    this._steam    = steam;
-    this._i18n     = i18n;
-    this._data     = dataService;
+    this._orch       = orchestrator;
+    this._search     = search;
+    this._references = references;
+    this._classify   = classify;
+    this._steam      = steam;
+    this._i18n       = i18n;
+    this._data       = dataService;
     this._initialized = true;
 
     const tableEl = document.getElementById(this._tableId);
@@ -284,6 +308,57 @@ export class RowTable {
     if (changed) this._refreshOnFacts();
   }
 
+  /**
+   * Stamp `_parent` (serial) on each item's row by asking ReferencesService
+   * for the row's outbound refs and picking the highest-priority parent
+   * path (owner > builder > guild). Called by the orchestrator AFTER
+   * references.absorbBatch lands the current batch, so the references
+   * service is up-to-date for the items in question.
+   *
+   * If focus mode is active and any newly-stamped row's `_parent` equals
+   * the focus serial, the focus set is extended on the fly so children
+   * that arrive in a later batch still join the visible group.
+   */
+  absorbParents(items) {
+    if (!Array.isArray(items) || !this._references) return;
+    let changed = false;
+    let focusGrew = false;
+    for (const { serial } of items) {
+      const row = this.findRow(serial);
+      if (!row) continue;
+      const newParent = this._deriveParent(serial);
+      if (row._parent === newParent) continue;
+      row._parent = newParent;
+      changed = true;
+      if (this._focusSerial != null && newParent === this._focusSerial
+          && !this._focusSet.has(serial)) {
+        this._focusSet.add(serial);
+        focusGrew = true;
+      }
+    }
+    if (focusGrew) this._stampFocusGroups();
+    if (changed) this._refreshOnFacts();
+  }
+
+  /**
+   * Resolve the canonical parent serial for a row. Returns the FIRST
+   * outbound ref whose path is in PARENT_PATHS_PRIORITY (preserving
+   * priority order across the tiers), or null if none of the priority
+   * paths resolve to a loaded target row.
+   */
+  _deriveParent(serial) {
+    if (!this._references) return null;
+    const outbound = this._references.outboundFrom(serial);
+    if (!outbound.length) return null;
+    for (const paths of PARENT_PATHS_PRIORITY) {
+      for (const o of outbound) {
+        if (o.targetSerial == null) continue;
+        if (paths.includes(o.path)) return o.targetSerial;
+      }
+    }
+    return null;
+  }
+
   upsertRow(row) {
     const serial = row.actor_serial;
     const idx = this._allRows.findIndex(r => r.actor_serial === serial);
@@ -298,6 +373,10 @@ export class RowTable {
       this._allRows.splice(insertAt, 0, row);
     }
     this._stampDistance(row);
+    // Parents may have moved on this edit; re-derive from references
+    // (the orchestrator already refreshed references before calling us).
+    row._parent = this._deriveParent(serial);
+    if (this._focusSerial != null) this._stampFocusGroups();
     this._reloadDtData({ preservePaging: true });
   }
 
@@ -316,15 +395,164 @@ export class RowTable {
       return;
     }
     this._selectedSerial = serial;
-    this._dtApi?.draw(false);
+    this._enterFocus(serial);
     this._emit('row-selected', { serial });
   }
 
   clearSelection() {
     if (this._selectedSerial == null) return;
     this._selectedSerial = null;
-    this._dtApi?.draw(false);
+    this._exitFocus();
     this._emit('row-deselected', {});
+  }
+
+  /** Active focus serial, or null. Used by the chip renderer / tests. */
+  focusSerial() { return this._focusSerial; }
+
+  // ---- internal: focus mode ---------------------------------------------
+
+  /**
+   * Engage focus mode on `serial`. Filters the table to show only this
+   * row plus its direct children (rows whose `_parent` resolves to
+   * `serial`), pinned with the focused row at top and the children
+   * grouped beneath via RowGroup. `_stampFocusGroups` writes the
+   * `_focusGroup` synthetic field that DT sorts and groups on.
+   *
+   * Idempotent: re-entering on the same serial recomputes the set so a
+   * row that came back from a worker batch after the first entry can
+   * still join the group on the next click.
+   */
+  _enterFocus(serial) {
+    this._focusSerial = serial;
+    this._focusSet    = this._computeFocusSet(serial);
+    // Drop any active kind filter — focus mode wants every child to
+    // render regardless of kind, and the two filters would otherwise
+    // intersect (hiding e.g. all stations under a player when "npc"
+    // is the only selected pill). Not auto-restored on exit.
+    this.clearKindFilter();
+    this._stampFocusGroups();
+    if (this._dtApi) {
+      const rg = this._dtApi.rowGroup ? this._dtApi.rowGroup() : null;
+      if (rg) {
+        rg.dataSrc('_focusGroup');
+        rg.enable();
+      }
+      // DataTables.order() does NOT resolve `:name` column selectors —
+      // pass the resolved numeric index instead. (Verified: name-form
+      // sets the order config but no actual sort applies.)
+      const focusOrderIdx = this._dtApi.column('_focusOrder:name').index();
+      this._dtApi.order([[focusOrderIdx, 'asc']]);
+      this._dtApi.rows().invalidate();
+      this._dtApi.draw(false);
+    }
+    this._renderFocusChip();
+  }
+
+  /**
+   * Disengage focus mode and restore the default ordering / row group
+   * configuration. No-op if not currently focused.
+   */
+  _exitFocus() {
+    if (this._focusSerial == null) {
+      this._dtApi?.draw(false);
+      return;
+    }
+    this._focusSerial = null;
+    this._focusSet.clear();
+    // Clear synthetic fields on the rows that carried them.
+    for (const r of this._allRows) {
+      if (r._focusGroup !== undefined) r._focusGroup = undefined;
+      if (r._focusOrder !== undefined) r._focusOrder = undefined;
+    }
+    if (this._dtApi) {
+      const rg = this._dtApi.rowGroup ? this._dtApi.rowGroup() : null;
+      if (rg) rg.disable();
+      // Restore the order that _applyAnchorChange / rows-ready picked.
+      this._dtApi.order([this._anchor ? 1 : 0, 'asc']);
+      this._dtApi.rows().invalidate();
+      this._dtApi.draw(false);
+    }
+    this._renderFocusChip();
+  }
+
+  /**
+   * Compute the focus set: the focused row + every loaded row whose
+   * resolved `_parent` equals `serial`. Linear scan over `_allRows`;
+   * fast enough for the ~12k-row world.db.
+   *
+   * Note: rows whose worker batch hasn't landed yet have `_parent`
+   * unset. `absorbParents` re-checks the focus serial and extends
+   * `_focusSet` incrementally as more parents resolve.
+   */
+  _computeFocusSet(serial) {
+    const set = new Set([serial]);
+    for (const r of this._allRows) {
+      if (r._parent === serial) set.add(r.actor_serial);
+    }
+    return set;
+  }
+
+  /**
+   * Stamp `_focusGroup` (string key used by RowGroup) and `_focusOrder`
+   * (numeric sort key — focused row = 0, children = 1) on each row in
+   * the focus set. Other rows get the fields cleared so they don't
+   * leak across focus changes.
+   */
+  _stampFocusGroups() {
+    const focusSerial = this._focusSerial;
+    const focusRow    = focusSerial != null ? this.findRow(focusSerial) : null;
+    const focusLabel  = focusRow
+      ? (focusRow._name || focusRow._label || `#${focusSerial}`)
+      : `#${focusSerial}`;
+    // Use t() so localizable strings drive the group headers. Falls
+    // back to a plain default if the key isn't defined.
+    const t = this._t.bind(this);
+    const selfHeader     = t('ui.focus.selfGroup',     { serial: focusSerial, label: focusLabel, default: 'Selected — #{serial}' });
+    const childrenHeader = t('ui.focus.childrenGroup', { serial: focusSerial, label: focusLabel, default: 'Children of #{serial}' });
+
+    for (const r of this._allRows) {
+      if (r.actor_serial === focusSerial) {
+        r._focusGroup = selfHeader;
+        r._focusOrder = 0;
+      } else if (this._focusSet.has(r.actor_serial)) {
+        r._focusGroup = childrenHeader;
+        r._focusOrder = 1;
+      } else {
+        r._focusGroup = undefined;
+        r._focusOrder = undefined;
+      }
+    }
+  }
+
+  /**
+   * Render the focus-mode chip in the controls bar. Reuses the
+   * relationship chip slot styling but distinguishes via class. Clicking
+   * the × calls clearSelection so the user has a quick escape hatch from
+   * focus mode without having to click "close" on the detail panel.
+   */
+  _renderFocusChip() {
+    const chip = document.getElementById('focusChip');
+    if (!chip) return;
+    const t = this._t.bind(this);
+    if (this._focusSerial == null) {
+      chip.classList.add('hidden');
+      chip.innerHTML = '';
+      return;
+    }
+    const focusRow = this.findRow(this._focusSerial);
+    const label    = focusRow ? (focusRow._name || focusRow._label || '') : '';
+    // children count excludes the focused row itself.
+    const childCount = Math.max(0, this._focusSet.size - 1);
+    chip.classList.remove('hidden');
+    chip.innerHTML = `
+      <span class="focus-label">${escapeText(t('ui.focus.chipLabel', {
+        serial: this._focusSerial, label, count: childCount.toLocaleString(),
+        default: 'focus: #{serial} ({count} children)',
+      }))}</span>
+      <button id="focusClear" title="${escapeAttr(t('ui.focus.clear', { default: 'clear focus' }))}">×</button>
+    `;
+    document.getElementById('focusClear')
+      .addEventListener('click', () => this.clearSelection());
   }
 
   /**
@@ -451,6 +679,14 @@ export class RowTable {
       // the headers — the picker dialog calls `dt.colReorder.move()`.
       // `enable: false` so the drag UI is dormant; the API still works.
       colReorder: { enable: false },
+      // RowGroup is dormant until focus mode engages. `_enterFocus`
+      // sets dataSrc to `_focusGroup` and enables it; `_exitFocus`
+      // disables it again. Starting disabled keeps the normal table
+      // (no anchor / no selection) free of group headers.
+      rowGroup: {
+        dataSrc: '_focusGroup',
+        enable:  false,
+      },
       columns: this._buildColumns(),
       createdRow: (tr, rowData) => {
         tr.dataset.serial = rowData.actor_serial;
@@ -468,6 +704,16 @@ export class RowTable {
     $(tableEl).on('click.rowtable', 'tbody tr[data-serial]', (evt) => {
       const serial = parseInt(evt.currentTarget.dataset.serial, 10);
       if (Number.isFinite(serial)) this.setSelection(serial);
+    });
+    // Parent-link clicks inside the parent column — delegate so the
+    // handler survives every redraw and beats the tr-level navigation
+    // handler above (we stop propagation so the row's own click
+    // doesn't also fire).
+    $(tableEl).on('click.rowtable', 'tbody tr a.parent-link', (evt) => {
+      evt.preventDefault();
+      evt.stopPropagation();
+      const target = parseInt(evt.currentTarget.dataset.serial, 10);
+      if (Number.isFinite(target)) this.setSelection(target);
     });
   }
 
@@ -557,7 +803,35 @@ export class RowTable {
         },
       },
       {
-        // 4: class (label + optional Steam display name)
+        // 4: parent — primary parent serial resolved via ReferencesService.
+        // Populated asynchronously by `absorbParents` once references for
+        // a row land. Renders as a jump link "#N <label>" (or empty when
+        // unresolved / the row has no parent). Plays double duty as the
+        // RowGroup key in focus mode.
+        name:  'parent',
+        title: t('ui.tableHeader.parent'),
+        data:  '_parent',
+        orderable: true,
+        className: 'muted',
+        columnControl: [
+          {
+            extend: 'dropdown', icon: 'search',
+            content: [{ extend: 'searchPlain', placeholder: 'parent #' }],
+          },
+        ],
+        render: (data, type) => {
+          if (type !== 'display') return data == null ? '' : String(data);
+          if (data == null) return '';
+          const parentRow = this.findRow(data);
+          const label = parentRow ? (parentRow._name || parentRow._label || '') : '';
+          const labelHtml = label
+            ? ` <span class="muted">${escapeText(label)}</span>` : '';
+          return `<a href="#" class="parent-link" data-serial="${data}">`
+            + `<code>#${data}</code>${labelHtml}</a>`;
+        },
+      },
+      {
+        // 5: class (label + optional Steam display name)
         title: t('ui.tableHeader.class'),
         data:  '_label',
         orderable: false,
@@ -573,7 +847,7 @@ export class RowTable {
         },
       },
       {
-        // 4: summary
+        // 6: summary
         title: t('ui.tableHeader.summary'),
         data:  '_summary',
         orderable: false,
@@ -583,7 +857,7 @@ export class RowTable {
         },
       },
       {
-        // 5: owner — hidden by default; users can toggle it back on via
+        // 7: owner — hidden by default; users can toggle it back on via
         // the per-column dropdown menu's "Column visibility" sub-list.
         title: t('ui.tableHeader.owner'),
         data:  'actor_owner',
@@ -596,7 +870,7 @@ export class RowTable {
         },
       },
       {
-        // 6: blob size
+        // 8: blob size
         title: t('ui.tableHeader.blob'),
         data:  'blob_size',
         type:  'num',
@@ -608,7 +882,23 @@ export class RowTable {
         },
       },
       {
-        // 7: time — UTC. We force `type: 'string'` so the ColumnControl
+        // 9 (hidden): focus order — synthetic per-row sort key set when
+        // focus mode is engaged. Always hidden; users can't toggle it
+        // from the picker (added to the exclude set). DT needs a real
+        // column to order on, so we expose `_focusOrder` as one.
+        name:  '_focusOrder',
+        data:  '_focusOrder',
+        title: '',
+        orderable: true,
+        visible:   false,
+        type:      'num',
+        render: (data, type) => {
+          if (type === 'sort' || type === 'type') return data == null ? 999 : data;
+          return '';
+        },
+      },
+      {
+        // 10: time — UTC. We force `type: 'string'` so the ColumnControl
         // `searchDropdown` falls through to a plain text input (matches
         // by substring on the rendered "2026-05-13 04:56:15" form)
         // rather than the heavier datetime picker that the auto-detector
@@ -648,6 +938,13 @@ export class RowTable {
 
     const filter = (settings, _renderedData, _index, rowData) => {
       if (!settings.nTable || settings.nTable.id !== tableId) return true;
+      // Focus mode is the strongest gate — when active, only the focused
+      // row + its direct children are visible, regardless of any other
+      // filter. (The other filters still intersect, so a user can also
+      // search inside the focus subset.)
+      if (this._focusSerial != null && !this._focusSet.has(rowData.actor_serial)) {
+        return false;
+      }
       // Relationship filter is an explicit allow-list, so it short-circuits
       // first — hides every row whose serial isn't in the set, regardless
       // of text search / kind / anchor. The other filters still apply on
@@ -745,7 +1042,7 @@ export class RowTable {
     const moveDown  = document.getElementById('cpMoveDown');
     if (!btn || !dlg) return;
 
-    const EXCLUDE_ORIGINAL_IDX = new Set([1]);   // dist — anchor-managed
+    const EXCLUDE_ORIGINAL_IDX = new Set([1, 9]);   // dist (anchor-managed) + _focusOrder (focus-managed; always hidden)
 
     // Original-index → title map, captured once from the column config so
     // the list labels stay stable even if a future caller mutates titles.
@@ -1011,13 +1308,18 @@ export class RowTable {
         this._selectedSerial   = null;
         this._anchor           = null;
         this._relationshipFilter = null;
+        this._focusSerial      = null;
+        this._focusSet.clear();
         this._selectedKinds.clear();
         this._stampAllDistances();
         this._renderAnchorChip();
         this._renderRelationshipChip();
+        this._renderFocusChip();
         if (this._dtApi) {
           this._dtApi.column(1).visible(false, false);
           this._dtApi.order([0, 'asc']);
+          const rg = this._dtApi.rowGroup ? this._dtApi.rowGroup() : null;
+          if (rg) rg.disable();
         }
         this._reloadDtData({ preservePaging: false });
         this._emit('rows-replaced', {
@@ -1036,9 +1338,16 @@ export class RowTable {
       this._selectedSerial   = null;
       this._anchor           = null;
       this._relationshipFilter = null;
+      this._focusSerial      = null;
+      this._focusSet.clear();
       this._selectedKinds.clear();
       this._renderAnchorChip();
       this._renderRelationshipChip();
+      this._renderFocusChip();
+      if (this._dtApi) {
+        const rg = this._dtApi.rowGroup ? this._dtApi.rowGroup() : null;
+        if (rg) rg.disable();
+      }
       this._reloadDtData({ preservePaging: false });
       this._emit('rows-replaced', { rows: [], label: null, serverId: null });
     });

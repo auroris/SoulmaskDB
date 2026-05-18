@@ -30,6 +30,8 @@
     "datatables.net-colreorder-dt": "^2.1.2",
     "datatables.net-columncontrol-dt": "^1.2.1",
     "datatables.net-dt": "^2.3.8",
+    "datatables.net-rowgroup": "^1.6.0",
+    "datatables.net-rowgroup-dt": "^1.6.0",
     "flexsearch": "^0.8.212",
     "jquery": "^4.0.0",
     "lz4-wasm": "^0.9.2",

@@ -17,8 +17,6 @@ export const zh = {
   'ui.header.title':                'SOULMASK 存档',
   'ui.header.files':                '文件',
   'ui.header.files.title':          '打开数据库文件对话框',
-  'ui.header.verifyCodec':          '验证编解码器',
-  'ui.header.verifyCodec.title':    '对每个二进制块进行编解码往返测试并报告失败',
   'ui.header.steamCache':           'Steam 缓存 ({count})',
   'ui.header.steamCache.title':     '清除本地缓存的 Steam 显示名 (开发用)',
   'ui.header.stash':                '暂存 ({count})',
@@ -138,12 +136,6 @@ export const zh = {
   'ui.stash.paste':                 '粘贴到此处',
   'ui.stash.edit':                  '编辑',
   'ui.stash.delete':                '删除',
-
-  // ------------------------------------------------------------ verify dialog
-  'ui.verify.heading':              '编解码器往返测试结果',
-  'ui.verify.close':                '关闭',
-  'ui.verify.running':              '运行中…',
-  'ui.verify.loadingBlobs':         '加载二进制块…',
 
   // =========================================================================
   // gloss.* — Pinyin → 汉字. Best-effort; correct any mistakes here. Tokens

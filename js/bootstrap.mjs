@@ -55,6 +55,7 @@ import { ReferencesService }             from './references-service.mjs';
 import { Orchestrator }                  from './orchestrator.mjs';
 import { DataService }                   from './data-service.mjs';
 import { RowTable }                      from './row-table.mjs';
+import { HistoryService }                from './history-service.mjs';
 import { i18n }     from './i18n.mjs';
 import { en }       from './locale/en.mjs';
 import { zh }       from './locale/zh.mjs';
@@ -102,6 +103,7 @@ root.SMDB.ReferencesService = ReferencesService;
 root.SMDB.Orchestrator      = Orchestrator;
 root.SMDB.DataService       = DataService;
 root.SMDB.RowTable          = RowTable;
+root.SMDB.HistoryService    = HistoryService;
 
 // ── i18n / classify / steam / stash / partials ─────────────────────────────
 // Shimmed onto SMDB.* so existing call sites (app.mjs, partials' render
@@ -133,6 +135,7 @@ const referencesService = new ReferencesService({
 });
 const dataService       = new DataService();
 const rowTable          = new RowTable();
+const historyService    = new HistoryService();
 const orchestrator      = new Orchestrator({
   lz4:           lz4Service,
   sqlite:        sqliteService,
@@ -157,10 +160,16 @@ root.SMDB.search        = searchService;
 root.SMDB.references    = referencesService;
 root.SMDB.data          = dataService;
 root.SMDB.rowTable      = rowTable;
+root.SMDB.history       = historyService;
 root.SMDB.orchestrator  = orchestrator;
 
 // ── The only async step: boot wasm + init sub-modules ──────────────────────
 await orchestrator.init();
+
+// HistoryService binds to RowTable AFTER orchestrator.init has wired the
+// table (otherwise its listener subscription would land on a half-built
+// RowTable). It's pure DOM glue — no async work — so init is synchronous.
+historyService.init({ rowTable });
 
 // Hand off to the UI module. Static `import './app.mjs'` would hoist its
 // evaluation ahead of orchestrator.init(); the dynamic import fires only

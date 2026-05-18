@@ -6,6 +6,7 @@
 <link rel="stylesheet" href="lib/datatables.net-dt/dataTables.dataTables.css">
 <link rel="stylesheet" href="lib/datatables.net-columncontrol-dt/columnControl.dataTables.css">
 <link rel="stylesheet" href="lib/datatables.net-colreorder-dt/colReorder.dataTables.css">
+<link rel="stylesheet" href="lib/datatables.net-rowgroup-dt/rowGroup.dataTables.css">
 <style>
   :root {
     --bg: #1e1e1e;
@@ -48,6 +49,16 @@
     display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   header h1 { font-size: 13px; margin: 0; font-weight: normal; color: var(--accent); letter-spacing: 0.5px; }
   .spacer { flex: 1; }
+
+  /* CSS-only decode spinner. Shown next to the files button while the
+     worker pool is still streaming blob manifests into the search +
+     references indices. app.mjs toggles `.hidden` on orchestrator
+     'rows-ready' / 'file-loaded' / 'load-error'. */
+  .spinner { width: 14px; height: 14px; display: inline-block;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; animation: spinner-spin 0.8s linear infinite; }
+  .spinner.hidden { display: none; }
+  @keyframes spinner-spin { to { transform: rotate(360deg); } }
   button {
     background: var(--panel2); color: var(--text); border: 1px solid var(--border);
     padding: 4px 10px; cursor: pointer; font: inherit; border-radius: 2px;
@@ -89,6 +100,36 @@
     background: var(--panel2); font-size: 12px; color: var(--accent); }
   #relationshipChip.hidden { display: none; }
   #relationshipChip button { padding: 0 6px; }
+  /* Focus-mode chip — same shape as the relationship chip but a different
+     accent to make the two distinguishable when both happen to be live
+     (focus-mode acts as a strict superset filter, so the relationship
+     chip can still apply on top of it). */
+  #focusChip { display: inline-flex; gap: 6px; align-items: center;
+    padding: 2px 8px; border: 1px solid var(--warn); border-radius: 12px;
+    background: var(--panel2); font-size: 12px; color: var(--warn); }
+  #focusChip.hidden { display: none; }
+  #focusChip button { padding: 0 6px; }
+
+  /* Parent column jump link in the row table. */
+  a.parent-link { color: var(--accent); text-decoration: none; }
+  a.parent-link code { background: var(--bg); padding: 0 4px; border-radius: 2px;
+    color: var(--accent); font-size: 11px; }
+  a.parent-link:hover code { background: var(--panel2); }
+  a.parent-link:hover { text-decoration: underline; }
+
+  /* RowGroup headers — focus mode injects "Selected — #N" / "Children of #N"
+     as group headers when the table groups by `_focusGroup`. The base
+     RowGroup stylesheet renders the row mostly white-on-white; theme it
+     so the headers stand out in our dark palette. */
+  tr.dt-rowGroup-start td, tr.dt-rowGroup-end td {
+    background: var(--panel2) !important;
+    color: var(--accent);
+    font-weight: normal;
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+    font-size: 11px;
+    padding: 6px 10px;
+  }
   main { flex: 1; display: grid; grid-template-columns: 1fr; overflow: hidden; }
   /* Three-column grid when the detail panel is visible:
        [table (1fr)]  [resizer (4px)]  [detail (--detail-width, default 40%)]
@@ -285,12 +326,6 @@
   .rel-filters { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
   .rel-filters button.active { border-color: var(--accent); color: var(--accent); }
 
-  /* Verify results */
-  #verifyDialog .verify-summary { padding: 10px 14px; border-bottom: 1px solid var(--border); }
-  #verifyDialog .verify-fail { padding: 6px 10px; border-bottom: 1px solid var(--panel2); font-size: 11px; }
-  #verifyDialog .verify-fail .ser { color: var(--accent); display: inline-block; min-width: 60px; }
-  #verifyDialog .verify-fail .reason { color: var(--warn); }
-
   /* Data files dialog (owned by js/data-service.mjs) */
   #dataDialog { min-width: 640px; }
   #dataList { padding: 12px 14px; overflow-y: auto; flex: 1; }
@@ -350,28 +385,17 @@
   #dropOverlay .label { background: var(--panel); border: 1px solid var(--accent);
     border-radius: 4px; padding: 12px 24px; color: var(--accent); font-size: 14px;
     letter-spacing: 0.5px; }
-
-  /* Scripts diagnostic */
-  #scriptsDialog { min-width: 760px; }
-  #scriptsList table { width: 100%; border-collapse: collapse; font-size: 11px; }
-  #scriptsList th { position: sticky; top: 0; background: var(--panel2); padding: 6px 10px;
-    text-align: left; border-bottom: 1px solid var(--border); font-weight: normal; color: var(--muted); }
-  #scriptsList td { padding: 4px 10px; border-bottom: 1px solid var(--panel2); vertical-align: top;
-    word-break: break-all; }
-  #scriptsList td.count { text-align: right; color: var(--accent); white-space: nowrap; }
-  #scriptsList td.kind { white-space: nowrap; }
 </style>
 </head>
 <body>
 
 <header>
-  <h1 data-i18n="ui.header.title">SOULMASK world.db</h1>
+  <h1 data-i18n="ui.header.title">SOULMASK db</h1>
   <button id="manageFilesBtn" class="primary" data-i18n="ui.header.files" data-i18n-title="ui.header.files.title" title="Open the database files dialog">files</button>
+  <span id="decodeSpinner" class="spinner hidden" data-i18n-title="ui.header.decoding" title="decoding blobs…" aria-label="decoding blobs"></span>
   <span id="status" class="muted"></span>
   <span class="spacer"></span>
   <select id="langSelect" data-i18n-title="ui.header.language" title="Language"></select>
-  <button id="scriptsBtn" data-i18n="ui.header.scripts" data-i18n-title="ui.header.scripts.title" title="Browse distinct actor_script values, see what's unmapped" disabled>scripts</button>
-  <button id="verifyAllBtn" data-i18n="ui.header.verifyCodec" data-i18n-title="ui.header.verifyCodec.title" title="Round-trip-decode every blob and report failures" disabled>verify codec</button>
   <button id="stashBtn" data-i18n-title="ui.header.stash.title" title="Open the row stash">stash (0)</button>
   <span id="changedBadge"></span>
 </header>
@@ -385,6 +409,7 @@
   <button id="anchorAtBtn" data-i18n="ui.anchor.atButton" data-i18n-title="ui.anchor.atButton.title">📍 anchor at…</button>
   <span id="anchorChip" class="hidden"></span>
   <span id="relationshipChip" class="hidden"></span>
+  <span id="focusChip" class="hidden"></span>
 </section>
 
 <main id="main">
@@ -414,36 +439,6 @@
       <span data-i18n="ui.data.addLabel">add file:</span>
       <input type="file" id="dataFileInput" accept=".db,.sqlite,.db3" multiple style="max-width:260px;">
     </label>
-  </footer>
-</dialog>
-
-<dialog id="verifyDialog">
-  <header style="display:flex; justify-content:space-between; align-items:center; padding:10px 14px; background:var(--panel2); border-bottom:1px solid var(--border);">
-    <strong data-i18n="ui.verify.heading">Codec round-trip results</strong>
-    <button id="verifyClose" data-i18n="ui.verify.close">close</button>
-  </header>
-  <div class="verify-summary" id="verifySummary" data-i18n="ui.verify.running">Running…</div>
-  <div id="verifyFailures" style="overflow-y:auto; flex:1;"></div>
-</dialog>
-
-<dialog id="scriptsDialog">
-  <header style="display:flex; justify-content:space-between; align-items:center;">
-    <strong data-i18n="ui.scripts.heading">Scripts in this DB</strong>
-    <button id="scriptsClose" data-i18n="ui.scripts.close">close</button>
-  </header>
-  <div style="padding:8px 14px; border-bottom:1px solid var(--border); display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
-    <label style="display:flex; gap:6px; align-items:center; cursor:pointer;">
-      <input type="checkbox" id="scriptsFilterUnmapped">
-      <span data-i18n="ui.scripts.unmappedOnly">show only unmapped (other)</span>
-    </label>
-    <span class="spacer" style="flex:1;"></span>
-    <span class="muted" id="scriptsSummary"></span>
-  </div>
-  <div id="scriptsList" style="overflow:auto; flex:1;"></div>
-  <footer>
-    <button id="scriptsCopyUnmapped" data-i18n="ui.scripts.copyUnmapped">copy unmapped to clipboard</button>
-    <span class="spacer" style="flex:1;"></span>
-    <span class="muted" id="scriptsCopyStatus"></span>
   </footer>
 </dialog>
 
@@ -541,6 +536,8 @@
     "datatables.net-columncontrol-dt":   "/lib/datatables.net-columncontrol-dt/columnControl.dataTables.mjs",
     "datatables.net-colreorder":         "/lib/datatables.net-colreorder/dataTables.colReorder.mjs",
     "datatables.net-colreorder-dt":      "/lib/datatables.net-colreorder-dt/colReorder.dataTables.mjs",
+    "datatables.net-rowgroup":           "/lib/datatables.net-rowgroup/dataTables.rowGroup.mjs",
+    "datatables.net-rowgroup-dt":        "/lib/datatables.net-rowgroup-dt/rowGroup.dataTables.mjs",
     "flexsearch":                        "/lib/flexsearch/flexsearch.module.mjs"
   }
 }

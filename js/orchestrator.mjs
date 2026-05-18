@@ -132,6 +132,7 @@ export class Orchestrator {
     await this._rowTable.init({
       orchestrator: this,
       search:       this._search,
+      references:   this._references,
       dataService:  this._data,
       classify:     this._classify,
       steam:        this._steam,
@@ -183,6 +184,10 @@ export class Orchestrator {
         this._search.absorbBatch(data.items, { epoch: this._activeSearchEpoch });
         this._references.absorbBatch(data.items, { epoch: this._activeRefsEpoch });
         this._rowTable.absorbFacts(data.items);
+        // References must be absorbed BEFORE parents are derived — the
+        // derivation reads ReferencesService.outboundFrom() to pick the
+        // priority parent. Keep this call after `references.absorbBatch`.
+        this._rowTable.absorbParents(data.items);
       } else if (event === 'done') {
         this._search.markDone({ epoch: this._activeSearchEpoch });
         this._references.markDone({ epoch: this._activeRefsEpoch });
