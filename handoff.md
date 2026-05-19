@@ -103,11 +103,15 @@ order it deliberately.
   so `hasIndex()` is O(1) and refresh paths can do `remove` before
   `add` (FlexSearch's `add` would double-index an existing id).
 
-- **`ReferencesService`** (`js/references-service.mjs`). Cross-row GUID
-  reverse index, fed by the same FactExtractor `batch` events
-  SearchService consumes. The walker that produced this data
-  (`lib/unreal/refs.mjs::collectGuids`) lives upstream — the service
-  itself is pure book-keeping. State:
+- **`ReferencesService`** (`js/references-service.mjs`). Cross-row
+  reverse index over BOTH `Guid` struct values AND actor-instance
+  `ObjectRef` paths, fed by the same FactExtractor `batch` events
+  SearchService consumes. The walkers
+  (`lib/unreal/refs.mjs::collectGuids` and `::collectObjRefs`) live
+  upstream — the service itself is pure book-keeping. ObjectRef
+  resolution uses an `actorNameLookup` (wired by the orchestrator to
+  `RowTable.findRowByActorName`) because an ObjectRef's `path` field
+  equals the target row's `actor_name` verbatim. State:
   - `_guidIndex: Map<guid, [{serial, path, isIdentity}]>` — every
     property occurrence of a guid across all rows. Each entry is
     stamped with `isIdentity` at absorb time (true iff the path is
@@ -232,6 +236,29 @@ order it deliberately.
   re-engages focus mode on that parent — selection IS focus). The
   click handler `stopPropagation`s so the row's own click doesn't also
   fire.
+
+  **Parent derivation has two layers** (see `_deriveParent` in
+  row-table.mjs):
+    1. *Outbound GUID priority* — `ZhuRenGuid` > `JianZhuBuilderUid`
+       / `RaftSpaceBuilderUid` > `GongHuiGuid`. Covers NPCs (owner =
+       player), buildings/stations/vehicles (owner = builder), guild
+       members.
+    2. *Inbound ObjectRef at a parent-pointing path* — currently
+       `HBindBGCompActor` (NPC pawn → its inventory) and
+       `BindBaoGuoActor` (workbench / chest / container → its
+       inventory). Inventory storage rows carry no upward GUID ref of
+       their own; the OWNER points downward at them via an
+       ObjectProperty, so we resolve them by looking at INBOUND
+       ObjectRefs in `ReferencesService._objRefReferrersByName`.
+  Without layer 2 every BindBGCompActor / BGActor_* row would be
+  parentless. Add new path names to `PARENT_OBJREF_PATHS` as more
+  parent → child wiring is found.
+
+  **`findRowByActorName(name)`** — O(1) actor_name → row lookup backed
+  by a lazy Map (`_actorNameIndex`). Invalidated on every mutation
+  (rows-ready, unloaded, upsertRow, removeRow). Wired into
+  `ReferencesService.setActorNameLookup` by the orchestrator so the
+  service can resolve ObjectRef target paths to serials in O(1).
 
 - **`HistoryService`** (`js/history-service.mjs`). Single-purpose bridge
   between RowTable selection and the browser history stack. Subscribes
@@ -395,10 +422,20 @@ lib/unreal/
   primitives.mjs        FName + FGuid.
   structs.mjs           STRUCT_HANDLERS + StructValue.
   values.mjs            ObjectRef + SoftObjectRef + OpaqueValue +
-                        FTextValue. FTextValue wraps decoded FText
-                        (historyType -1 CultureInvariant / 0 Base).
+                        FTextValue. FTextValue wraps decoded FText for
+                        the four historyTypes seen on the wire:
+                          -1 CultureInvariant — displayString
+                           0 Base/Localized   — namespace + key + sourceString
+                           2 OrderedFormat    — sourceFmt + [args]
+                           4 AsNumber         — sourceValue + formatOptions
+                                                + culture
                         Its `.text` getter returns the best displayable
-                        string (displayString for -1, sourceString for 0).
+                        string for each (the format string for 2, the
+                        raw numeric value for 4). HistoryType 4 quirk:
+                        ALL four embedded booleans (bHasFormatOptions,
+                        AlwaysSign, UseGrouping, bHasCulture) serialize
+                        as uint32 — legacy UE3 bool format, not the
+                        UE4.27 default uint8.
   properties.mjs        PropertyTag + Property + Array/Set/Map values +
                         readValue / writeValue + property-stream r/w.
                         Encoder is byte-identical round-trip across all
@@ -856,18 +893,41 @@ multi-thousand-row regression in the round-trip test before being fixed:
    Per-field `_*IsNull` flags are captured on read and forwarded to
    `writeFString` on write.
 
-5. **ArrayProperty<ObjectProperty> elements need a sizeHint.** Inner
-   ObjectProperty elements have variable shapes (kind-only, +path,
-   +path+classPath, +full embedded stream) and no per-element delimiter.
-   Without a budget, the element greedily reads all four fields and
-   overruns into the next property's tag — the cursor goes off the rails
-   and the cursor-snap can't recover the row (cf. `ChengHaoList` with
-   `numElements=1` and a kind+path-only element). `readArrayValue`
-   computes a per-element budget (`(remainingBudget) / numElementsLeft`)
-   and passes it to `readArrayElement`, which mirrors `readObjectValue`'s
-   bounded early-exit logic. `writeArrayElement` no longer forces
-   `requireClassPath: true` — the writer respects whatever the read
-   captured.
+5. **ArrayProperty<ObjectProperty> elements use content-based field
+   detection, not equal-split budgets.** Inner ObjectProperty elements
+   have variable shapes (kind-only, +path, +path+classPath, +full
+   embedded stream) with no per-element delimiter. The original equal-
+   split heuristic (`floor(remainingBudget / numElementsLeft)`) breaks
+   on `JianZhuInstYuanXings`-style arrays where one element legitimately
+   needs more bytes than the average (e.g. an embedded `MapProperty`
+   value of 30 KB while siblings are 1-byte null references) — the big
+   element's stream gets truncated mid-property, then the cursor crashes
+   into the next element's bytes as garbage. The current scheme gives
+   each element the FULL remaining array budget as a generous upper
+   bound and lets four content-based peeks decide field boundaries:
+   - **kind=0 early-out** — null-reference elements are JUST the kind
+     byte; observed in trailing slots of `JianZhuInstYuanXings`,
+     `ZhuangBeiLanDaoJuJiYiList`, `KuaiJieLanDaoJuJiYiList`.
+   - **classPath '/' guard** — Soulmask classPaths are always
+     `/Script/...` or `/Game/...`, so the first content byte must be
+     `0x2F`. Catches the case where bytes after `path` are actually
+     the next element's `kind` + `kindOnePrefix` (e.g. `01 01 00 00`
+     reads as a "saveNum=257" that the magnitude check misses).
+   - **Embedded-stream identifier-start guard** — embedded streams
+     start with a `PropertyTag` whose first FString is the property
+     name; property names start with a letter or underscore. If the
+     byte at `cursor.pos()+4` isn't `[A-Za-z_]`, no embedded stream
+     follows.
+   - **4-byte trailer detection** — after the embedded stream's None
+     terminator, peek the next 4 bytes. If they're all zero (typical
+     `FName.Number = 0` trailer pattern), consume them and set
+     `hasTerminatorTrailer=true`; the same condition works for both
+     mid-array elements (next element's `kind=1`/`3` follows, non-zero)
+     and the last element before the trailing binary section (origin's
+     12 zero bytes follow, distinctively zero-padded).
+
+   `writeArrayElement` does not force `requireClassPath: true` — the
+   writer respects whatever the reader captured.
 
 6. **Known-binary structs can appear as TAGGED property streams.**
    Inside Map struct values, Soulmask sometimes serializes
@@ -887,54 +947,104 @@ For all six, `null` vs `''` semantics and value-shape matter — don't
 normalize them away in helper layers (i18n, search index, etc.) or
 you'll re-introduce the byte drift.
 
-## ArrayProperty<ObjectProperty> trailing binary
+7. **Soulmask `kind=0x01` ObjectProperty actor-reference variant.**
+   Hard actor references (e.g. an NPC pawn's `HBindBGCompActor` →
+   its inventory actor) serialize with an extra 4-byte field between
+   the kind byte and the path FString: `u8 kind=0x01 | u32 prefix |
+   FString path | FString classPath`. The prefix value is always 1 in
+   the samples we've seen — semantic meaning unknown (a flag, an
+   FName.Number, or a count) — but the writer has to replay whatever
+   the reader captured, so `ObjectRef` stores it as `_kindOnePrefix`
+   and `readObjectValue` / `readArrayElement` consume it only when
+   `kind === 0x01`. Without this branch the reader treated the prefix
+   as the path FString's SaveNum, overshot the budget, and silently
+   downgraded the property to `OpaqueValue` — which is why every
+   pawn→inventory link was invisible to `ReferencesService` until
+   2026-05-18. Verified: 11,667 / 11,667 still round-trip
+   byte-identical after the change.
 
-A Soulmask-specific custom format that lives inside the tag size budget
-of certain `ArrayProperty<ObjectProperty>` values, after the standard
-tagged element data. Discovered while investigating the 62 positive-gap
-`_sizeMismatch` cases on `JianZhuInstYuanXings` (building instance
-prototype lists on boats, rafts, built structures).
+## ArrayProperty<ObjectProperty> per-element trailing (JianZhuInstYuanXings)
 
-Layout (after `numElements` int32 and `numElements` standard
-ObjectProperty elements, within the array tag's `size` budget):
+A Soulmask-specific custom binary layout that lives inside the tag size
+budget of `JianZhuInstYuanXings` (building instance prototype lists on
+the `BP_JianZhuPianQu` building-zone actors that hold all of a player's
+structures — foundations, walls, doors, etc., plus the equivalent on
+boats and rafts).
+
+`numElements` does NOT equal placed-piece count. It counts how many
+**distinct prototype shapes** the zone uses (1 if the player only built
+foundations; 4 if they used foundation + wall + door frame + thatch
+foundation — verified by an in-game test bonfire experiment 2026-05-18
+where each new prototype incremented numElements by 1).
+
+Layout (after the `int32 numElements` field):
 
 ```
-[3 × float32]                 origin (observed always (0,0,0))
-repeated until budget exhausted:
-  [u32 stride]   [u32 count]  section header
-  [count × stride bytes]      packed binary payload
+for each prototype i in 0..numElements-1:
+  ObjectRef                    kind=3 yuan-xing definition. Standard
+                               wire form: kind byte | path FString |
+                               classPath FString "/Script/WS.HJianZhuInstComponent" |
+                               embedded property stream | "None" terminator |
+                               4-byte FName.Number trailer. The embedded
+                               stream carries MapInstJianZhuDataList (per-
+                               piece HP map), JianZhuYuanXingName, and
+                               JianZhuYuanXingClass.
+  [8 bytes zero header]        Always observed as zeros. Treated as
+                               opaque; replayed verbatim.
+  [u32 stride=64] [u32 count]  [count × 64 bytes]
+                               World 4×4 row-major FMatrix44 transforms
+                               for placed pieces of prototype i.
+                               Translation at floats[12..14].
+                               count = number of placed pieces of this prototype.
+  [u32 stride= 4] [u32 count]  [count × 4 bytes]
+                               Per-piece u32 piece-ids (matches the
+                               JianZhuUid keys in MapInstJianZhuDataList).
+                               Same count as section 0.
+  [u32 stride=64] [u32 count]  [count × 64 bytes]
+                               Auxiliary per-piece struct (bounding box
+                               + scale-ish floats based on inspection;
+                               not yet decoded semantically). count is
+                               typically equal to or 1 greater than
+                               section 0's count.
 ```
 
-Empirically the sections always come as a triple:
-- **section 0**: `stride=64, count=N` — N world 4×4 transform matrices
-  for placed building pieces. Row-major `FMatrix44`, translation at
-  `floats[12..14]`.
-- **section 1**: `stride=4,  count=N` — N per-piece `u32` IDs.
-- **section 2**: `stride=64, count=M` — M local 4×4 transforms for
-  prototype shapes (typically M = N or N+1).
+Decoder: `lib/unreal/properties.mjs::tryReadObjectArrayPerElementTrailing`.
+Called once per element from `readArrayValue`'s loop, returns null when
+the bytes don't match the format (so non-JianZhuInstYuanXings object
+arrays are unaffected). On success the parsed `{ header, sections }`
+is stored on `ArrayValue._perElementTrailings[i]`, parallel to
+`elements[i]`. Round-trip: `writeArrayValue` emits each element's
+trailing immediately after the element, before moving to the next.
 
-Decoder lives in `lib/unreal/properties.mjs::readObjectArrayTrailing`
-and stores the parsed result on `ArrayValue._trailing` as
-`{ origin, sections: [{stride, count, data}] }`. If structural checks
-fail (implausible stride, count, or budget-overshoot), it falls back to
-`{ _raw, _parseError }` and the writer emits the raw bytes verbatim so
-byte-identical round-trip still holds. Verified: all 62 affected rows
-parse cleanly (0 raw fallbacks) and the trailing section serializes
-byte-identical via `writeObjectArrayTrailing`.
+A legacy `ArrayValue._trailing` field remains for the
+"single trailing block after all elements" case — currently unused on
+any `world.db` row but kept for backward compatibility in case other
+arrays use that older layout.
 
-Renderer (`js/property-tree.mjs::renderArrayTrailing`) appends the
-parsed sections as expandable children after the array's normal
-elements: each `stride=64` item shows its translation inline with the
-full 4×4 matrix as collapsible children; each `stride=4` item shows
-the `u32` value; unknown strides render as hex sample bytes.
+Earlier hypotheses that turned out wrong, kept here so they don't get
+re-derived:
+- **"3-float origin"**. The first 8 bytes of a per-element trailing
+  block are zeros, but they aren't a 3-float `FVector` — they're 8B,
+  not 12B. A 12-byte read would consume bytes 8..11 (the stride=64) as
+  `origin.z`, then mis-read section 0's count as a stride and the first
+  4 transform bytes as a count ("implausible count 3204775516"). The
+  one-stone-foundation in-game test settled this empirically.
+- **"`numElements` = placed-piece count"**. Adding a second stone
+  foundation while keeping the prototype the same did NOT change
+  `numElements` (still 1); it increased section 0/1 counts to 2 and
+  section 2 to 3. `numElements` only ticks up when you place a piece
+  whose prototype isn't already in the zone.
+- **"`kind=0` placeholder slots"**. Earlier the reader saw `0x00` bytes
+  after elem[0] (the 8-byte header for the next prototype) and treated
+  them as `kind=0` null-reference elements one byte each. For
+  numElements > 9 the placeholders overran the 8-byte zero header into
+  the section data; the fix is now the per-element trailing read AFTER
+  each element, so subsequent elements start at the correct kind=3
+  yuan-xing byte.
 
-The reader gate is intentionally narrow: trailing parsing only kicks
-in for `ArrayProperty<ObjectProperty>` (and the other Object-family
-inner types) where the element decode left a positive remainder within
-`tag.size`. Normal arrays that consume exactly `tag.size` are
-untouched; over-reading arrays (`ChengHaoList` etc.) don't enter this
-path either, since the cursor is already past the budget when we'd
-check. So the change is additive — no existing decode behavior moves.
+Renderer (`js/property-tree.mjs::renderArrayValue`) walks each element
+and appends its per-element trailing as a child node, so the tree
+visually mirrors the prototype-by-prototype structure.
 
 ## Known issues / footguns
 
@@ -943,6 +1053,49 @@ check. So the change is additive — no existing decode behavior moves.
   row round-trips byte-identically through the encoder. If new save
   files surface new mismatches, `test-roundtrip.mjs` will flag them
   immediately (it exits non-zero on any unexpected failure).
+
+- **OpaqueValue audit** (`world.db`, 11,667 rows, 2026-05-18).
+  After all the structured-decode work, the decoder produces
+  **ZERO `OpaqueValue` leaves** — down from 7,455 before. Every property
+  in every row now decodes structurally; round-trip is byte-identical.
+  Categories decoded:
+    - **FTextHistory_AsNumber** (historyType=4): 4,298 → 0
+    - **TextProperty inside ArrayProperty**: 7,253 → 0
+    - **SetProperty<StructProperty>**: 2 → 0
+    - **ArrayProperty<ObjectProperty> budget errors**: ~150 → 0
+    - **`JianZhuInstYuanXings` multi-prototype zones**: 15 → 0 (see below)
+
+- **`JianZhuInstYuanXings` per-element trailing format** (2026-05-18,
+  verified by in-game experiment with 1 stone foundation → 2 → +wall →
+  +door frame → +disconnected thatch foundation). The decode previously
+  assumed a single "trailing binary section" after all array elements,
+  which only worked for single-prototype zones (numElements=1). The
+  actual wire layout interleaves placement-binary **per element**:
+
+  ```
+  int32 numElements              (= count of UNIQUE prototypes in the zone)
+  for each prototype i:
+    kind=3 ObjectRef             (yuan-xing definition: path + classPath +
+                                  embedded {MapInstJianZhuDataList,
+                                  JianZhuYuanXingName, JianZhuYuanXingClass}
+                                  + None + 4-byte FName.Number trailer)
+    8 bytes zero header
+    [u32 64] [u32 count_i_pieces] [count×64 bytes]  ← world 4×4 transforms
+    [u32  4] [u32 count_i_pieces] [count× 4 bytes]  ← per-piece u32 ids
+    [u32 64] [u32 count_i_aux  ]  [count×64 bytes]  ← per-piece aux (bbox+scale-ish)
+  ```
+
+  Decoded into `ArrayValue._perElementTrailings[i] = { header, sections }`
+  parallel to `elements[i]`. The reader detects per-element trailing by
+  peeking 8 zero bytes + stride=64 immediately after each element; the
+  legacy `_trailing` field is still populated when bytes remain at the
+  array's tail (for backward compat — currently unused on world.db).
+
+  numElements **does not equal placed-piece count**. It counts how many
+  distinct prototype shapes the zone uses (e.g. 1 stone foundation alone
+  = numElements=1 even with 28 pieces placed; foundation + wall = 2).
+  Section 0/1 counts are the placed-piece count for that prototype.
+  Doors are attachments to door frames, not separate prototypes.
 
 - **TLA + classic defer ordering.** If you add a `<script
   type="module">` that uses top-level await, do not mix it with

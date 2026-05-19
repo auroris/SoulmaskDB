@@ -65,6 +65,22 @@ const PARENT_PATHS_PRIORITY = [
 ];
 const PARENT_PATHS_FLAT = new Set(PARENT_PATHS_PRIORITY.flat());
 
+// ObjectRef property paths that the OWNER carries pointing at its child.
+// Inverse direction from PARENT_PATHS_PRIORITY: here the child looks at
+// its INBOUND ObjectRef referrers and treats whoever points at it via
+// one of these paths as its parent. Used for inventory storage rows,
+// which carry no upward GUID ref of their own — the parent points
+// downward at the inventory actor:
+//   HBindBGCompActor   — NPC pawn → its inventory (`BindBGCompActor`)
+//   BindBaoGuoActor    — workbench / chest / container station → its
+//                        inventory (`BGActor_*` family — workbenches,
+//                        repair stations, dismantle tables, traps, etc.)
+// Add new path names here as more parent → inventory wiring is found.
+const PARENT_OBJREF_PATHS = new Set([
+  'HBindBGCompActor',
+  'BindBaoGuoActor',
+]);
+
 // Register a plain-text search content type with ColumnControl. The
 // stock `searchText` always renders an operator <select> ("Contains",
 // "Equals", "Starts", "Ends", "Empty", "Not empty", …). For columns
@@ -210,6 +226,22 @@ export class RowTable {
   rows()          { return this._allRows; }
   count()         { return this._allRows.length; }
   findRow(serial) { return this._allRows.find(r => r.actor_serial === serial) || null; }
+
+  /**
+   * O(1) lookup by `actor_name` — backs ReferencesService's
+   * `actorNameLookup` (ObjectRef target → serial resolution). The map
+   * is built lazily on first call and rebuilt whenever the row set
+   * changes (rows-ready, unloaded, upsertRow, removeRow).
+   */
+  findRowByActorName(actorName) {
+    if (!this._actorNameIndex) {
+      const m = new Map();
+      for (const r of this._allRows) if (r.actor_name) m.set(r.actor_name, r);
+      this._actorNameIndex = m;
+    }
+    return this._actorNameIndex.get(actorName) || null;
+  }
+  _invalidateActorNameIndex() { this._actorNameIndex = null; }
   selectedSerial(){ return this._selectedSerial; }
   hasAnchor()     { return !!this._anchor; }
   isAnchoredOn(serial) { return !!this._anchor && this._anchor.serial === serial; }
@@ -323,11 +355,12 @@ export class RowTable {
     if (!Array.isArray(items) || !this._references) return;
     let changed = false;
     let focusGrew = false;
-    for (const { serial } of items) {
+
+    const updateParent = (serial) => {
       const row = this.findRow(serial);
-      if (!row) continue;
+      if (!row) return;
       const newParent = this._deriveParent(serial);
-      if (row._parent === newParent) continue;
+      if (row._parent === newParent) return;
       row._parent = newParent;
       changed = true;
       if (this._focusSerial != null && newParent === this._focusSerial
@@ -335,25 +368,74 @@ export class RowTable {
         this._focusSet.add(serial);
         focusGrew = true;
       }
+    };
+
+    // First pass: refresh parents for the rows whose batch just landed.
+    for (const { serial } of items) updateParent(serial);
+
+    // Second pass: if any of those rows carry an outbound ObjectRef at
+    // a parent-pointing path (e.g. a pawn's `HBindBGCompActor`), the
+    // *target* row's parent may now resolve via the inbound-ObjRef
+    // layer of `_deriveParent`. Re-derive each unique target. Without
+    // this an inventory whose decode batch arrived first stays
+    // parentless until something else triggers a redraw.
+    if (this._references.outboundObjRefsFrom) {
+      const targetsToReDerive = new Set();
+      for (const { serial } of items) {
+        const refs = this._references.outboundObjRefsFrom(serial);
+        for (const r of refs) {
+          if (r.targetSerial == null) continue;
+          if (!PARENT_OBJREF_PATHS.has(r.path)) continue;
+          targetsToReDerive.add(r.targetSerial);
+        }
+      }
+      for (const target of targetsToReDerive) updateParent(target);
     }
+
     if (focusGrew) this._stampFocusGroups();
     if (changed) this._refreshOnFacts();
   }
 
   /**
-   * Resolve the canonical parent serial for a row. Returns the FIRST
-   * outbound ref whose path is in PARENT_PATHS_PRIORITY (preserving
-   * priority order across the tiers), or null if none of the priority
-   * paths resolve to a loaded target row.
+   * Resolve the canonical parent serial for a row. Two layers, tried
+   * in order:
+   *
+   *   1. **Outbound GUID refs** (priority `ZhuRenGuid` → builder →
+   *      `GongHuiGuid`). Most relationships flow this way — the child
+   *      carries a GUID pointing at its owner / builder / guild.
+   *      First resolvable hit wins.
+   *
+   *   2. **Inbound ObjectRef refs** at parent-pointing paths
+   *      (`PARENT_OBJREF_PATHS`, currently just `HBindBGCompActor`).
+   *      Inverse direction from layer 1 — the parent points down at
+   *      the child via an ObjectProperty, not the other way around.
+   *      This is how inventory storage rows (`BindBGCompActor`,
+   *      `BGActor_*`) discover their pawn/NPC/workbench owner —
+   *      they have no upward GUID ref of their own, but the pawn
+   *      carries `HBindBGCompActor` pointing at them.
+   *
+   * Returns null if neither layer resolves a loaded target row. Parents
+   * for inventory rows may be null until the OWNER row's decode batch
+   * lands (since the ref lives on the parent's side); `absorbParents`
+   * re-derives target rows of each freshly-absorbed ObjectRef so the
+   * inventory's parent fills in as soon as its owner is indexed.
    */
   _deriveParent(serial) {
     if (!this._references) return null;
+    // Layer 1: outbound GUID priority.
     const outbound = this._references.outboundFrom(serial);
-    if (!outbound.length) return null;
     for (const paths of PARENT_PATHS_PRIORITY) {
       for (const o of outbound) {
         if (o.targetSerial == null) continue;
         if (paths.includes(o.path)) return o.targetSerial;
+      }
+    }
+    // Layer 2: inbound ObjectRef at a parent-pointing path.
+    const row = this.findRow(serial);
+    if (row && row.actor_name && this._references.referrersByActorName) {
+      const referrers = this._references.referrersByActorName(row.actor_name);
+      for (const r of referrers) {
+        if (PARENT_OBJREF_PATHS.has(r.path) && r.serial !== serial) return r.serial;
       }
     }
     return null;
@@ -372,6 +454,7 @@ export class RowTable {
       }
       this._allRows.splice(insertAt, 0, row);
     }
+    this._invalidateActorNameIndex();
     this._stampDistance(row);
     // Parents may have moved on this edit; re-derive from references
     // (the orchestrator already refreshed references before calling us).
@@ -384,6 +467,7 @@ export class RowTable {
     const idx = this._allRows.findIndex(r => r.actor_serial === serial);
     if (idx < 0) return;
     this._allRows.splice(idx, 1);
+    this._invalidateActorNameIndex();
     if (this._selectedSerial === serial) this.clearSelection();
     this._reloadDtData({ preservePaging: true });
   }
@@ -1311,6 +1395,7 @@ export class RowTable {
         this._focusSerial      = null;
         this._focusSet.clear();
         this._selectedKinds.clear();
+        this._invalidateActorNameIndex();
         this._stampAllDistances();
         this._renderAnchorChip();
         this._renderRelationshipChip();
@@ -1341,6 +1426,7 @@ export class RowTable {
       this._focusSerial      = null;
       this._focusSet.clear();
       this._selectedKinds.clear();
+      this._invalidateActorNameIndex();
       this._renderAnchorChip();
       this._renderRelationshipChip();
       this._renderFocusChip();

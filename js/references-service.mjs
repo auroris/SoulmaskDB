@@ -152,12 +152,19 @@ export class ReferencesService {
    *   absent (e.g. in tests) the service falls back to DEFAULT_IDENTITY_PATH
    *   for every row.
    */
-  constructor({ codecs, collectGuids, kindLookup = null } = {}) {
+  constructor({ codecs, collectGuids, collectObjRefs = null, kindLookup = null, actorNameLookup = null } = {}) {
     if (!codecs)       throw new Error('ReferencesService: codecs is required');
     if (!collectGuids) throw new Error('ReferencesService: collectGuids is required');
-    this._codecs       = codecs;
-    this._collectGuids = collectGuids;
-    this._kindLookup   = kindLookup;
+    this._codecs         = codecs;
+    this._collectGuids   = collectGuids;
+    this._collectObjRefs = collectObjRefs;
+    this._kindLookup     = kindLookup;
+    // (actorName) → serial | null. Used to resolve ObjectRef targets,
+    // since an ObjectRef's `path` equals the target row's `actor_name`
+    // verbatim. Wired post-construction by the orchestrator (mirroring
+    // `setKindLookup`); absent in tests, in which case ObjectRef targets
+    // simply stay unresolved (targetSerial=null).
+    this._actorNameLookup = actorNameLookup;
 
     this._guidIndex             = new Map();
     this._outboundByRow         = new Map();
@@ -169,6 +176,19 @@ export class ReferencesService {
     // bookkeeping is what lets `_removeRow` clean them up without
     // scanning every `_guidIndex` bucket.
     this._nestedIdentitiesByRow = new Map();
+
+    // ObjectRef indexes, parallel to the Guid set above. The wire-side
+    // target is the full Unreal actor path (which equals the target
+    // row's `actor_name` in SQL). `_actorNameLookup` resolves it to a
+    // serial at query time so a target row that hasn't been absorbed
+    // yet still gets resolved later as its batch lands.
+    //   _outboundObjRefsByRow   Map<serial, [{path, targetPath}]>
+    //                           per-row outbound ObjectRef refs whose
+    //                           target path looks like an actor instance.
+    //   _objRefReferrersByName  Map<actorName, [{serial, path}]>
+    //                           reverse index: who points AT this actor_name?
+    this._outboundObjRefsByRow  = new Map();
+    this._objRefReferrersByName = new Map();
 
     this._totalRefs = 0;
     this._listeners = new Set();
@@ -182,6 +202,15 @@ export class ReferencesService {
    * its own row list.
    */
   setKindLookup(fn) { this._kindLookup = fn || null; }
+
+  /**
+   * Provide / replace the actor-name lookup used to resolve ObjectRef
+   * targets. Wired post-construction by the orchestrator to a RowTable
+   * lookup. When unset, `outboundObjRefsFrom` returns entries with
+   * `targetSerial: null` — the index still tracks the path, the resolver
+   * just can't map it to a serial.
+   */
+  setActorNameLookup(fn) { this._actorNameLookup = fn || null; }
 
   currentEpoch() { return this._epoch; }
 
@@ -235,10 +264,11 @@ export class ReferencesService {
     try {
       const decoded  = this._codecs.decode(bytes);
       const guidRefs = this._collectGuids(decoded);
-      refs = new Array(guidRefs.length);
-      for (let i = 0; i < guidRefs.length; i++) {
-        refs[i] = { kind: 'guid', guid: guidRefs[i].guid, path: guidRefs[i].path };
-      }
+      const objRefs  = this._collectObjRefs ? this._collectObjRefs(decoded) : [];
+      refs = new Array(guidRefs.length + objRefs.length);
+      let i = 0;
+      for (const g of guidRefs) refs[i++] = { kind: 'guid',   guid: g.guid, path: g.path };
+      for (const o of objRefs)  refs[i++] = { kind: 'objref', path: o.path, targetPath: o.targetPath };
     } catch {
       return;
     }
@@ -261,6 +291,8 @@ export class ReferencesService {
     this._selfUidByRow.clear();
     this._rowBySelfUid.clear();
     this._nestedIdentitiesByRow.clear();
+    this._outboundObjRefsByRow.clear();
+    this._objRefReferrersByName.clear();
     this._totalRefs = 0;
     this._emit('reset', null);
   }
@@ -328,6 +360,40 @@ export class ReferencesService {
     return out;
   }
 
+  /**
+   * Every actor-instance ObjectRef this row points at, with the target
+   * resolved to a serial via `_actorNameLookup`. Returns entries shaped
+   * `[{path, targetPath, targetSerial}]` — the path where the ref lives
+   * inside the source blob, the referenced actor's full Unreal path
+   * (= target row's `actor_name`), and the resolved serial or null.
+   */
+  outboundObjRefsFrom(serial) {
+    const outbound = this._outboundObjRefsByRow.get(serial);
+    if (!outbound) return [];
+    const out = new Array(outbound.length);
+    for (let i = 0; i < outbound.length; i++) {
+      const o = outbound[i];
+      out[i] = {
+        path: o.path,
+        targetPath: o.targetPath,
+        targetSerial: this._actorNameLookup ? (this._actorNameLookup(o.targetPath) ?? null) : null,
+      };
+    }
+    return out;
+  }
+
+  /**
+   * Reverse lookup: which rows reference an actor whose `actor_name`
+   * equals `actorName`? Returns `[{serial, path}]` — each entry is one
+   * source row + the property path at which it holds the ObjectRef.
+   * Used by RowTable to compute the parent of inventory rows (whose
+   * owner points at them via `HBindBGCompActor` or similar).
+   */
+  referrersByActorName(actorName) {
+    const bucket = this._objRefReferrersByName.get(actorName);
+    return bucket ? bucket.slice() : [];
+  }
+
   stats() { return this._statsPayload(); }
 
   // ── internals ────────────────────────────────────────────────────────
@@ -350,16 +416,29 @@ export class ReferencesService {
     // Idempotent — strip any prior entries for this serial first.
     if (this._outboundByRow.has(serial)
         || this._selfUidByRow.has(serial)
-        || this._nestedIdentitiesByRow.has(serial)) {
+        || this._nestedIdentitiesByRow.has(serial)
+        || this._outboundObjRefsByRow.has(serial)) {
       this._removeRow(serial);
     }
     if (!Array.isArray(references) || references.length === 0) return;
 
     const identityPath = this._identityPathFor(serial);
 
-    let outbound = null;
-    let nested   = null;
+    let outbound       = null;
+    let nested         = null;
+    let outboundObjRef = null;
     for (const ref of references) {
+      if (ref.kind === 'objref') {
+        if (!ref.targetPath || !ref.path) continue;
+        if (!outboundObjRef) outboundObjRef = [];
+        outboundObjRef.push({ path: ref.path, targetPath: ref.targetPath });
+        // Reverse index: targetPath → [{serial: us, path: where-we-point}].
+        let bucket = this._objRefReferrersByName.get(ref.targetPath);
+        if (!bucket) { bucket = []; this._objRefReferrersByName.set(ref.targetPath, bucket); }
+        bucket.push({ serial, path: ref.path });
+        this._totalRefs++;
+        continue;
+      }
       if (ref.kind !== 'guid' || !ref.guid) continue;
       const isIdentity       = ref.path === identityPath;
       const isNestedIdentity = !isIdentity && isNestedIdentityPath(ref.path);
@@ -404,8 +483,9 @@ export class ReferencesService {
         outbound.push({ guid: ref.guid, path: ref.path });
       }
     }
-    if (outbound) this._outboundByRow.set(serial, outbound);
-    if (nested)   this._nestedIdentitiesByRow.set(serial, nested);
+    if (outbound)       this._outboundByRow.set(serial, outbound);
+    if (nested)         this._nestedIdentitiesByRow.set(serial, nested);
+    if (outboundObjRef) this._outboundObjRefsByRow.set(serial, outboundObjRef);
   }
 
   _removeRow(serial) {
@@ -437,6 +517,21 @@ export class ReferencesService {
       if (this._rowBySelfUid.get(selfUid) === serial) {
         this._rowBySelfUid.delete(selfUid);
       }
+    }
+    const objRefs = this._outboundObjRefsByRow.get(serial);
+    if (objRefs) {
+      for (const { targetPath } of objRefs) {
+        const bucket = this._objRefReferrersByName.get(targetPath);
+        if (!bucket) continue;
+        for (let i = bucket.length - 1; i >= 0; i--) {
+          if (bucket[i].serial === serial) {
+            bucket.splice(i, 1);
+            this._totalRefs--;
+          }
+        }
+        if (bucket.length === 0) this._objRefReferrersByName.delete(targetPath);
+      }
+      this._outboundObjRefsByRow.delete(serial);
     }
   }
 

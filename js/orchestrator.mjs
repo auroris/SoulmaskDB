@@ -149,6 +149,14 @@ export class Orchestrator {
       return r ? r._kind : null;
     });
 
+    // ObjectRef target paths are the same string as the target row's
+    // SQL `actor_name`. RowTable maintains an actor_name → serial map so
+    // this resolver is O(1).
+    this._references.setActorNameLookup((actorName) => {
+      const r = this._rowTable.findRowByActorName(actorName);
+      return r ? r.actor_serial : null;
+    });
+
     // 4: stream fact-extractor batches into the search index.
     this._installFactForwarding();
   }

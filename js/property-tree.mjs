@@ -420,12 +420,14 @@ function renderStructValue(sv, depth) {
 function renderArrayValue(tag, value, depth) {
   const hasElements = value && value.elements && value.elements.length > 0;
   const hasTrailing = value && value._trailing;
-  if (!hasElements && !hasTrailing) {
+  const perEl = value?._perElementTrailings;
+  const hasPerEl = Array.isArray(perEl) && perEl.some(t => t != null);
+  if (!hasElements && !hasTrailing && !hasPerEl) {
     return leaf(`<span class="muted">[]</span>`);
   }
   const innerType = tag.innerType.value;
   // Show inline if elements are tiny primitives and the array is small.
-  const isShortPrim = hasElements && !hasTrailing && value.elements.length <= 8
+  const isShortPrim = hasElements && !hasTrailing && !hasPerEl && value.elements.length <= 8
     && ['IntProperty','FloatProperty','BoolProperty','NameProperty','StrProperty'].includes(innerType);
   if (isShortPrim) {
     return leaf(`= <code>${escapeText(JSON.stringify(value.elements.map(stringifyForInline)))}</code>`);
@@ -435,15 +437,20 @@ function renderArrayValue(tag, value, depth) {
     || innerType === 'WeakObjectProperty' || innerType === 'LazyObjectProperty'
     || innerType === 'WSObjectProperty';
   const renderItem = (e, i) => {
+    let body;
     if (innerType === 'StructProperty') {
       const { inline, children } = renderStructValue(e, childDepth);
-      return renderSyntheticRow(`[${i}]`, inline, children, childDepth);
-    }
-    if (isObjType) {
+      body = renderSyntheticRow(`[${i}]`, inline, children, childDepth);
+    } else if (isObjType) {
       const { inline, children } = renderObjectRefValue(e, childDepth);
-      return renderSyntheticRow(`[${i}]`, inline, children, childDepth);
+      body = renderSyntheticRow(`[${i}]`, inline, children, childDepth);
+    } else {
+      body = renderSyntheticRow(`[${i}]`, `= <code>${escapeText(stringifyForInline(e))}</code>`, '', childDepth);
     }
-    return renderSyntheticRow(`[${i}]`, `= <code>${escapeText(stringifyForInline(e))}</code>`, '', childDepth);
+    // Per-element trailing (JianZhuInstYuanXings placement-binary): render
+    // alongside its element so the relationship is visible in the tree.
+    if (perEl && perEl[i]) body += renderArrayTrailing(perEl[i], childDepth);
+    return body;
   };
   let children = hasElements ? renderCappedItems(value.elements, renderItem, childDepth) : '';
   let inlineExtra = '';
@@ -455,6 +462,9 @@ function renderArrayValue(tag, value, depth) {
       const counts = value._trailing.sections.map(s => s.count).join('/');
       inlineExtra = ` <span class="muted">+ trailing (${counts})</span>`;
     }
+  } else if (hasPerEl) {
+    const totalSections = perEl.reduce((a, t) => a + (t?.sections?.length || 0), 0);
+    inlineExtra = ` <span class="muted">+ ${perEl.filter(t => t).length}× per-element trailing (${totalSections} sections)</span>`;
   }
   const inline = hasElements
     ? `<span class="muted">${escapeText(t('ui.tree.items', { count: value.elements.length }))}</span>${inlineExtra}`
@@ -463,7 +473,7 @@ function renderArrayValue(tag, value, depth) {
 }
 
 // Render the Soulmask trailing binary for ArrayProperty<ObjectProperty>:
-//   origin (Vector) + N self-describing sections (stride/count/data).
+//   8-byte header + N self-describing sections (stride/count/data).
 // See readObjectArrayTrailing in lib/unreal/properties.mjs for the format.
 function renderArrayTrailing(trailing, depth) {
   if (trailing._raw) {
@@ -471,9 +481,13 @@ function renderArrayTrailing(trailing, depth) {
     return renderSyntheticRow(`<span class="muted">trailing</span>`, inline, '', depth);
   }
   const parts = [];
-  const { x, y, z } = trailing.origin;
-  if (x !== 0 || y !== 0 || z !== 0) {
-    parts.push(renderSyntheticRow('origin', `= <code>(${x.toFixed(3)}, ${y.toFixed(3)}, ${z.toFixed(3)})</code>`, '', depth + 1));
+  // Surface the 8-byte header only if it's non-zero (universally zero in the
+  // wild so far; rendering a "header = 00 00 00 00 00 00 00 00" row for every
+  // building zone would just be noise).
+  const hdr = trailing.header;
+  if (hdr && hdr.some(b => b !== 0)) {
+    const hex = Array.from(hdr).map(b => b.toString(16).padStart(2, '0')).join(' ');
+    parts.push(renderSyntheticRow('header', `= <code>${hex}</code>`, '', depth + 1));
   }
   for (let i = 0; i < trailing.sections.length; i++) {
     parts.push(renderTrailingSection(trailing.sections[i], i, depth + 1));

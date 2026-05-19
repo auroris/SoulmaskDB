@@ -43,7 +43,7 @@ import {
   lz4Decompress, lz4Compress, OUTER_VERSION_TAG,
 } from '../lib/unreal/blob.mjs';
 import { collectStrings } from '../lib/unreal/strings.mjs';
-import { collectGuids }   from '../lib/unreal/refs.mjs';
+import { collectGuids, collectObjRefs } from '../lib/unreal/refs.mjs';
 import { codecJson }      from './codec-json.mjs';
 import { codecs as defaultCodecs, createRegistry } from './codecs.mjs';
 import { DecodePool }     from '../lib/workers/pool.mjs';
@@ -85,6 +85,7 @@ Object.assign(root.SMDB.unreal, {
   codec: unrealCodec,
   collectStrings,
   collectGuids,
+  collectObjRefs,
 });
 
 root.SMDB.codecJson             = codecJson;
@@ -132,6 +133,7 @@ const searchService     = new SearchService({
 const referencesService = new ReferencesService({
   codecs: defaultCodecs,
   collectGuids,
+  collectObjRefs,
 });
 const dataService       = new DataService();
 const rowTable          = new RowTable();
